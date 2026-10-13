@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="FPL">
+  <meta name="theme-color" content="#f3f2f2">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <?!= include('Stylesheet'); ?>
+</head>
+<body>
+  <div class="page">
+    <header class="masthead">
+      <div class="rule rule-thick"></div>
+      <div class="masthead-row">
+        <h1 class="masthead-title"><a href="<?= appUrl ?>">The Command Centre</a></h1>
+        <div class="masthead-meta">
+          <div class="entry-name">Debug</div>
+          <div id="genLabel">Loading diagnostics…</div>
+        </div>
+      </div>
+      <div class="rule rule-thin"></div>
+      <div class="dateline">
+        <div class="dateline-left">
+          <span class="source-tag">Live</span>
+          <span class="muted" style="font-size:11px" title="Deployed version (PR number, or commit if not a PR merge · UTC deploy date)"><?= appVersion ?></span>
+        </div>
+        <div class="dateline-controls">
+          <a class="link-btn" href="<?= appUrl ?>">← Back to dashboard</a>
+          <a class="link-btn" href="<?= appUrl ?>?page=ratings">Player Ratings →</a>
+          <a class="link-btn" href="<?= appUrl ?>?page=wire">The Wire →</a>
+        </div>
+      </div>
+    </header>
+
+    <main id="app">
+      <div class="loading">Pulling diagnostics…</div>
+    </main>
+  </div>
+
+  <script>
+    var STATE = { data: null, lastRun: null };
+
+    function loadDebug() {
+      google.script.run.withSuccessHandler(onData).withFailureHandler(renderError).getDebugPageData();
+    }
+
+    function renderError(err) {
+      document.getElementById('app').innerHTML =
+        '<p class="error-text">Something went wrong: ' + escapeHtml_(err.message || err) + '</p>' +
+        '<button onclick="loadDebug()">Try again</button>';
+    }
+
+    function escapeHtml_(s) {
+      return String(s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+
+    function onData(data) {
+      STATE.data = data;
+      document.getElementById('genLabel').textContent =
+        'Stage-by-stage timing for the main dashboard load, plus pipeline/key status — for tracking down a slow or stuck load without Apps Script editor access.';
+      renderApp();
+      document.body.style.opacity = '1';
+    }
+
+    function renderApp() {
+      var app = document.getElementById('app');
+      var html = '';
+      html += sectionLastRequest(STATE.data);
+      html += sectionRunNow();
+      html += sectionApiHealth();
+      html += sectionStatus(STATE.data);
+      html += sectionLog(STATE.data);
+      app.innerHTML = html;
+    }
+
+    /* ===================== RUN NOW ===================== */
+
+    function sectionRunNow() {
+      var html = '<section><div class="section-kicker">Run dashboard load now</div>';
+      html += '<p class="muted" style="margin-bottom:var(--space-3)">Runs a real getDashboardData() call from here and reports what happens — success, timing, or the exact error — without leaving this page or depending on the main dashboard finishing.</p>';
+      html += '<button class="btn" id="runNowBtn" onclick="runNow()">Run it now</button>';
+      html += '<div id="runNowResult" style="margin-top:var(--space-3)">' + (STATE.lastRun ? runNowResultHtml_(STATE.lastRun) : '') + '</div>';
+      html += '</section>';
+      return html;
+    }
+
+    function runNow() {
+      var btn = document.getElementById('runNowBtn');
+      if (btn) btn.disabled = true;
+      document.getElementById('runNowResult').innerHTML = '<p class="muted">Running…</p>';
+      google.script.run
+        .withSuccessHandler(function (result) { onRunNowDone_(result, null); })
+        .withFailureHandler(function (err) { onRunNowDone_(null, err); })
+        .runDashboardDiag();
+    }
+
+    function onRunNowDone_(result, err) {
+      STATE.lastRun = err ? { ok: false, error: err.message || String(err) } : result;
+      var out = document.getElementById('runNowResult');
+      if (out) out.innerHTML = runNowResultHtml_(STATE.lastRun);
+      var btn = document.getElementById('runNowBtn');
+      if (btn) btn.disabled = false;
+      loadDebug(); // refresh the log below with whatever this run just wrote
+    }
+
+    function runNowResultHtml_(r) {
+      if (!r.ok) {
+        return '<p class="error-text">Failed after ' + r.elapsedMs + 'ms: ' + escapeHtml_(r.error) + '</p>';
+      }
+      var bits = [];
+      if (r.needsSetup) bits.push('no Team ID saved yet');
+      else if (r.noSquadYet) bits.push('no readable squad (preseason, or bad Team ID)');
+      else if (r.hasSquad) bits.push('squad loaded successfully');
+      var html = '<p>Succeeded in ' + r.elapsedMs + 'ms — ' + bits.join(', ') + '.</p>';
+
+      /* Which gameweek the run thought it was in. Three separate answers,
+         because they are three separate questions and conflating them was a
+         whole class of bug on its own. */
+      var gs = r.gameweekState;
+      if (gs) {
+        html += '<p class="muted">' +
+          (gs.liveInPlay ? 'GW' + gs.liveEventId + ' being played' : 'no gameweek in play') +
+          ' · picking for ' + (gs.decisionEventId != null ? 'GW' + gs.decisionEventId : 'nothing') +
+          ' · squad read from ' + (gs.picksEventId != null ? 'GW' + gs.picksEventId : 'nowhere') +
+          '</p>';
+      }
+      var led = r.transferLedger;
+      if (led) html += '<p class="muted">Transfer ledger: ' + escapeHtml_(led.summary) +
+        ' · +' + led.netGain + ' net over ' + led.horizonGws + ' GWs</p>';
+
+      /* Correctness, not just health. A run that returns quickly and returns
+         something impossible is a failed run. */
+      var inv = r.invariants;
+      if (inv) {
+        if (inv.ok) {
+          html += '<p class="ok-text">Model invariants: all checks passed.</p>';
+        }
+        (inv.warnings || []).forEach(function (w) {
+          html += '<p class="error-text">Implausible (not blocking) — ' + escapeHtml_(w.check) +
+            ': ' + escapeHtml_(w.detail) + '</p>';
+        });
+        if (!inv.ok) {
+          html += '<p class="error-text">MODEL INVALID — ' + inv.failures.length + ' check' +
+            (inv.failures.length === 1 ? '' : 's') + ' failed. The front-page verdict is withheld.</p><ul>';
+          inv.failures.forEach(function (f) {
+            html += '<li class="error-text">' + escapeHtml_(f.check) + ' — ' + escapeHtml_(f.detail) + '</li>';
+          });
+          html += '</ul>';
+        }
+      }
+      return html;
+    }
+
+    /* ===================== FPL API HEALTH ===================== */
+
+    function sectionApiHealth() {
+      var html = '<section><div class="rule rule-thin"></div><div style="margin-top:var(--space-6)">';
+      html += '<div class="section-kicker">FPL API health</div>';
+      html += '<p class="muted" style="margin-bottom:var(--space-3)">Hits fantasy.premierleague.com directly — none of this app\'s own logic in the way — to tell apart "the upstream API is slow/down" from "something in this app is broken."</p>';
+      html += '<button class="btn" id="apiHealthBtn" onclick="checkApiHealth()">Check FPL API</button>';
+      html += '<div id="apiHealthResult" style="margin-top:var(--space-3)">' + (STATE.lastApiHealth ? apiHealthResultHtml_(STATE.lastApiHealth) : '') + '</div>';
+      html += '</div></section>';
+      return html;
+    }
+
+    function toggleDebugLogging(enable) {
+      document.body.style.opacity = '0.6';
+      google.script.run
+        .withSuccessHandler(function () { loadDebug(); })
+        .withFailureHandler(function (err) { document.body.style.opacity = '1'; alert('Failed to toggle: ' + (err.message || err)); })
+        .setDebugLoggingEnabled(enable);
+    }
+
+    function checkApiHealth() {
+      var btn = document.getElementById('apiHealthBtn');
+      if (btn) btn.disabled = true;
+      document.getElementById('apiHealthResult').innerHTML = '<p class="muted">Checking…</p>';
+      google.script.run
+        .withSuccessHandler(function (result) { onApiHealthDone_(result, null); })
+        .withFailureHandler(function (err) { onApiHealthDone_(null, err); })
+        .checkFplApiHealth();
+    }
+
+    function onApiHealthDone_(result, err) {
+      STATE.lastApiHealth = err ? { ok: false, elapsedMs: null, error: err.message || String(err) } : result;
+      var out = document.getElementById('apiHealthResult');
+      if (out) out.innerHTML = apiHealthResultHtml_(STATE.lastApiHealth);
+      var btn = document.getElementById('apiHealthBtn');
+      if (btn) btn.disabled = false;
+    }
+
+    function apiHealthResultHtml_(r) {
+      if (!r.ok) {
+        return '<p class="error-text">FPL API unhealthy' + (r.elapsedMs != null ? ' (after ' + r.elapsedMs + 'ms)' : '') +
+          ': ' + escapeHtml_(r.error || 'unknown error') + '</p>';
+      }
+      return '<p>FPL API is up — HTTP ' + r.httpCode + ' in ' + r.elapsedMs + 'ms, ' +
+        (r.elementsCount != null ? r.elementsCount + ' players, ' : '') + (r.bodyBytes / 1024).toFixed(0) + 'KB response.</p>';
+    }
+
+    /* ===================== PIPELINE / KEY STATUS ===================== */
+
+    function sectionStatus(data) {
+      var html = '<section><div class="rule rule-thin"></div><div style="margin-top:var(--space-6)">';
+      html += '<div class="section-kicker">Status</div>';
+
+      var badge = function (ok, label) {
+        return '<span class="pill ' + (ok ? 'pill-cool' : 'pill-hot') + '" style="margin-right:var(--space-2);margin-bottom:var(--space-2)">' +
+          escapeHtml_(label) + ': ' + (ok ? 'yes' : 'no') + '</span>';
+      };
+
+      html += '<p class="muted" style="margin-bottom:var(--space-2)">Deployed version: <strong>' +
+        escapeHtml_(data.appVersion || 'unknown') + '</strong>' + deployedVersionLink_(data.appVersion) + '</p>';
+      html += '<p class="muted" style="margin-bottom:var(--space-2)">Team ID: <strong>' +
+        (data.teamId ? escapeHtml_(data.teamId) : 'none saved') + '</strong></p>';
+      html += '<p class="muted" style="margin-bottom:var(--space-3)">Stage logging: <strong>' + (data.debugLoggingEnabled ? 'ON' : 'OFF') +
+        '</strong> — adds a PropertiesService read+write per stage (~20/load); a toggle to test whether that overhead itself contributes to the null-data issue, not just something to assume away. ' +
+        '<button class="btn" style="font-size:12px;padding:4px 10px" onclick="toggleDebugLogging(' + (data.debugLoggingEnabled ? 'false' : 'true') + ')">Turn ' +
+        (data.debugLoggingEnabled ? 'OFF' : 'ON') + '</button></p>';
+      html += '<div style="margin-bottom:var(--space-3)">';
+      html += badge(!!data.teamId, 'Team ID saved');
+      html += badge(data.hasAiKey, 'Anthropic key');
+      html += badge(data.hasYoutubeKey, 'YouTube key');
+      html += badge(data.hasGeminiKey, 'Gemini key');
+      html += '</div>';
+
+      if (data.triggerStatus) {
+        html += '<div>';
+        html += badge(data.triggerStatus.weeklyInstalled, 'Weekly trigger (reminders + verdict)');
+        html += badge(data.triggerStatus.panelInstalled, 'Panel trigger');
+        html += '</div>';
+      }
+
+      html += '</div></section>';
+      return html;
+    }
+
+    /* ===================== LAST REQUEST (headline summary, no manual scanning needed) ===================== */
+
+    function sectionLastRequest(data) {
+      var l = data.log || {};
+      if (l.error || !l.rows || !l.rows.length) return '';
+
+      var latestId = l.rows[0][1];
+      var rowsForLatest = l.rows.filter(function (r) { return r[1] === latestId; });
+      var totalRow = rowsForLatest.filter(function (r) { return r[2] === 'TOTAL'; })[0];
+      var errorRows = rowsForLatest.filter(function (r) { return r[5] === 'error'; });
+      var stageCount = rowsForLatest.length;
+
+      var html = '<section><div class="section-kicker">Last request</div>';
+      html += '<p>Request <strong>' + escapeHtml_(latestId) + '</strong> at ' + escapeHtml_(shortTime_(rowsForLatest[rowsForLatest.length - 1][0])) + ' — ';
+      if (totalRow) {
+        html += 'completed all ' + stageCount + ' stages in <strong>' + escapeHtml_(totalRow[4]) + 'ms</strong>' +
+          (totalRow[6] ? ' (' + escapeHtml_(totalRow[6]) + ')' : '') + '.';
+      } else {
+        var lastStage = rowsForLatest[0];
+        html += '<span class="error-text">did NOT reach TOTAL</span> — last stage logged was "' + escapeHtml_(lastStage[2]) +
+          '" at ' + escapeHtml_(lastStage[4]) + 'ms in. Whatever ran after that stage is where it stalled or the request ended.';
+      }
+      html += '</p>';
+      if (errorRows.length) {
+        html += '<p class="error-text">' + errorRows.length + ' stage(s) errored: ' +
+          errorRows.map(function (r) { return escapeHtml_(r[2]) + ' (' + escapeHtml_(r[6]) + ')'; }).join('; ') + '</p>';
+      }
+      html += '</section>';
+      return html;
+    }
+
+    /* ===================== DEBUG LOG (PropertiesService-backed ring buffer, rendered inline) ===================== */
+
+    function sectionLog(data) {
+      var html = '<section><div class="rule rule-thin"></div><div style="margin-top:var(--space-6)">';
+      html += '<div class="section-kicker">Dashboard load log</div>';
+
+      var l = data.log || {};
+      if (l.error) {
+        html += '<p class="error-text">Debug log itself failed: ' + escapeHtml_(l.error) + '</p>';
+        html += '</div></section>';
+        return html;
+      }
+
+      html += '<p class="muted" style="margin-bottom:var(--space-3)">Most recent stages logged, newest first — the row that\'s missing after a reload is where it stalled.</p>';
+
+      if (!l.rows || !l.rows.length) {
+        html += '<p class="muted">No rows yet — reload the main dashboard, or click "Run it now" above, then come back and reload this page.</p>';
+      } else {
+        html += '<div style="overflow-x:auto"><table class="table"><thead><tr>' +
+          '<th>Time</th><th>Request</th><th>Stage</th><th>Stage ms</th><th>Total ms</th><th>Status</th><th>Detail</th>' +
+          '</tr></thead><tbody>';
+        l.rows.forEach(function (row) {
+          var statusClass = row[5] === 'error' ? 'error-text' : '';
+          html += '<tr>' +
+            '<td class="muted" style="font-size:12px">' + escapeHtml_(shortTime_(row[0])) + '</td>' +
+            '<td class="muted" style="font-size:11px">' + escapeHtml_(row[1]) + '</td>' +
+            '<td>' + escapeHtml_(row[2]) + '</td>' +
+            '<td>' + escapeHtml_(row[3]) + '</td>' +
+            '<td>' + escapeHtml_(row[4]) + '</td>' +
+            '<td class="' + statusClass + '">' + escapeHtml_(row[5]) + '</td>' +
+            '<td style="font-size:12px">' + escapeHtml_(row[6] || '') + '</td>' +
+            '</tr>';
+        });
+        html += '</tbody></table></div>';
+      }
+
+      html += '</div></section>';
+      return html;
+    }
+
+    function shortTime_(iso) {
+      try { return new Date(iso).toTimeString().slice(0, 8); } catch (e) { return String(iso); }
+    }
+
+    // The version stamp is "PR #NN · date" for a merge-to-main deploy, or a
+    // bare commit SHA for a direct push. Set REPO_URL to your own repository
+    // to link the stamp straight to that PR's diff.
+    var REPO_URL = '';
+    function deployedVersionLink_(appVersion) {
+      var m = /^PR #(\d+)/.exec(appVersion || '');
+      if (!m || !REPO_URL) return '';
+      return ' — <a href="' + REPO_URL + '/pull/' + m[1] + '/files" target="_blank">view diff →</a>';
+    }
+
+    loadDebug();
+  </script>
+</body>
+</html>

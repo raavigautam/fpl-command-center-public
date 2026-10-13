@@ -1,0 +1,2177 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="FPL">
+  <meta name="theme-color" content="#f3f2f2">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <?!= include('Stylesheet'); ?>
+</head>
+<body>
+  <div class="page">
+    <header class="masthead">
+      <div class="rule rule-thick"></div>
+      <div class="masthead-row">
+        <h1 class="masthead-title">The Command Centre</h1>
+        <div class="masthead-meta">
+          <div class="entry-name" id="entryName">—</div>
+          <div id="entrySub">Loading your squad…</div>
+        </div>
+      </div>
+      <div class="rule rule-thin"></div>
+      <div class="dateline">
+        <div class="dateline-left">
+          <span id="gwLabel">GW —</span>
+          <span id="deadlineLabel">Deadline —</span>
+          <span class="countdown" id="countdown">—</span>
+          <span class="source-tag" id="sourceTag">Live</span>
+          <span class="muted" style="font-size:11px" title="Deployed version (PR number, or commit if not a PR merge · UTC deploy date)"><?= appVersion ?></span>
+        </div>
+        <div class="dateline-controls">
+          <input type="text" id="teamIdInput" placeholder="Team ID" inputmode="numeric" style="width:110px">
+          <select id="riskSelect" title="Risk appetite">
+            <option value="safe">Safe</option>
+            <option value="balanced">Balanced</option>
+            <option value="aggressive">Aggressive</option>
+          </select>
+          <button onclick="submitTeamId()">Refresh</button>
+          <button class="palette-trigger" onclick="openPalette()" title="Command palette">
+            <span>Command</span><kbd id="paletteKeyHint">&#8984;K</kbd>
+          </button>
+          <a class="link-btn" href="<?= appUrl ?>?page=ratings">Player Ratings →</a>
+          <a class="link-btn" href="<?= appUrl ?>?page=wire">The Wire →</a>
+          <a class="link-btn" href="<?= appUrl ?>?page=debug" title="Stage-by-stage timing for every dashboard load — if a load hangs, the row that's missing is where it stalled">Debug →</a>
+        </div>
+      </div>
+    </header>
+
+    <main id="app">
+      <div class="loading">Pulling live data from the FPL API…</div>
+    </main>
+  </div>
+
+  <!-- Command palette. Lives outside .page so it can sit above everything,
+       and is inert until opened — no listeners run and no index is built
+       until the first Cmd+K. -->
+  <div class="palette-backdrop" id="paletteBackdrop" hidden onclick="if(event.target===this)closePalette()">
+    <div class="palette" role="dialog" aria-modal="true" aria-label="Command palette">
+      <div class="palette-input-row">
+        <span class="palette-prompt" aria-hidden="true">&gt;</span>
+        <input type="text" id="paletteInput" autocomplete="off" spellcheck="false"
+               placeholder="Type a command, or a player&rsquo;s name…"
+               aria-label="Command" aria-controls="paletteResults" aria-expanded="true">
+        <kbd class="palette-esc">esc</kbd>
+      </div>
+      <div class="palette-answer" id="paletteAnswer" hidden></div>
+      <div class="palette-results" id="paletteResults" role="listbox"></div>
+      <div class="palette-foot">
+        <span><kbd>&uarr;</kbd><kbd>&darr;</kbd> move</span>
+        <span><kbd>&crarr;</kbd> run</span>
+        <span><kbd>/</kbd> commands</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    var STATE = { data: null, chatHistory: [] };
+    // Absolute, for the same reason every cross-page link on this page is:
+    // a relative URL resolves against the inner content frame, which never
+    // re-invokes doGet and renders blank.
+    var RATINGS_URL = '<?= appUrl ?>?page=ratings';
+    var deadlineTimer = null;
+    var loadWatchdogTimer = null;
+    var LOAD_WATCHDOG_MS = 20000;
+    var lastPingResult = null;
+
+    function loadDashboard(forceFresh) {
+      var startedAt = Date.now();
+
+      // Fired alongside the real call, not gating it — a passive comparison
+      // point. Every other explanation (payload size, PR #13's code, this
+      // debugging effort's own overhead) has already been ruled out by
+      // direct testing. If a near-instant, near-empty response ALSO comes
+      // back null from this exact page, the cause is this page's calling
+      // context, not getDashboardData()'s specific response.
+      google.script.run
+        .withSuccessHandler(function (r) { lastPingResult = (r && r.ok) ? ('ok, ts=' + r.ts) : ('unexpected: ' + JSON.stringify(r)); })
+        .withFailureHandler(function (err) { lastPingResult = 'RPC failure: ' + (err.message || err); })
+        .pingTest();
+      // The one failure mode nothing else here can catch: google.script.run
+      // never calling EITHER handler at all — not a slow server (proven fast
+      // via the Debug page), not a thrown rendering error (the onData
+      // try/catch would show that), just the browser never getting a
+      // response back from the RPC bridge. If that's what's happening, this
+      // is the only thing that will ever say so instead of sitting on the
+      // loading placeholder forever with genuinely nothing to look at.
+      if (loadWatchdogTimer) clearTimeout(loadWatchdogTimer);
+      loadWatchdogTimer = setTimeout(function () {
+        document.getElementById('app').innerHTML =
+          '<p class="error-text">Still waiting after ' + Math.round((Date.now() - startedAt) / 1000) +
+          's with no response at all from the server call — neither success nor failure ever arrived. ' +
+          'This points at something between this page and Apps Script (browser cache, extension, network), not the server itself — ' +
+          'the <a href="<?= appUrl ?>?page=debug">Debug →</a> page\'s "Run it now" button tests the same call independently of this page.</p>' +
+          '<button onclick="loadDashboard()">Try again</button>';
+      }, LOAD_WATCHDOG_MS);
+
+      // getDashboardDataJson() (not getDashboardData() directly): Debug page
+      // evidence showed multiple separate server executions completing with
+      // a correctly-sized response in the exact window this page got null —
+      // while a trivial pingTest() on the same load always got through.
+      // That points at google.script.run's automatic object marshalling
+      // dropping this specific (larger, nested) response in transit, not a
+      // server-side failure. Returning it pre-serialized as a JSON string
+      // sends a primitive across the bridge instead of an object tree; this
+      // page does one JSON.parse() on arrival.
+      google.script.run
+        .withSuccessHandler(function (json) { clearTimeout(loadWatchdogTimer); onDataJson_(json); })
+        .withFailureHandler(function (err) { clearTimeout(loadWatchdogTimer); renderError(err); })
+        .getDashboardDataJson(!!forceFresh);
+    }
+
+    function onDataJson_(json) {
+      if (!json) { onData(null); return; }
+      var data;
+      try {
+        data = JSON.parse(json);
+      } catch (e) {
+        onData(null);
+        return;
+      }
+      onData(data);
+    }
+
+    function renderError(err) {
+      document.getElementById('app').innerHTML =
+        '<p class="error-text">Something went wrong: ' + escapeHtml_(err.message || err) + '</p>' +
+        '<button onclick="loadDashboard()">Try again</button>' +
+        '<p class="muted" style="margin-top:var(--space-2)">Check the <a href="<?= appUrl ?>?page=debug">Debug →</a> page for stage-by-stage timing on this load.</p>';
+    }
+
+    function pts_(n) { return n + (Math.abs(n) === 1 ? ' pt' : ' pts'); }
+
+    function escapeHtml_(s) {
+      return String(s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+
+    /* ---------- escape-by-default element builder ----------
+     *
+     * This page renders by accumulating one long innerHTML string, and its
+     * XSS safety rests entirely on remembering escapeHtml_ at every point
+     * where API-supplied text is interpolated — player news, league names,
+     * the Panel's prose. The discipline has held, but it is discipline: every
+     * new section re-rolls the dice, and the failure is silent when it loses.
+     *
+     * `h` inverts the default. Text content is escaped unless it is wrapped
+     * in `raw()`, which makes including unescaped markup a visible, greppable
+     * act rather than the consequence of forgetting something. Attribute
+     * values are always escaped, with no opt-out.
+     *
+     * This is not a framework and does not need adopting wholesale — the
+     * existing string builders are fine where they only interpolate numbers
+     * this app computed itself. It is for the places that render text from
+     * outside, which is where the risk actually lives.
+     */
+    function raw(html) { return { __raw: String(html == null ? '' : html) }; }
+
+    var VOID_TAGS = { br: 1, hr: 1, img: 1, input: 1, meta: 1, link: 1 };
+
+    function h(tag, attrs, children) {
+      var out = '<' + tag;
+      Object.keys(attrs || {}).forEach(function (k) {
+        var v = attrs[k];
+        // false/null/undefined drop the attribute entirely, so conditional
+        // attributes read as `{disabled: isDisabled}` rather than needing a
+        // ternary that builds a string.
+        if (v === false || v == null) return;
+        if (v === true) { out += ' ' + k; return; }
+        out += ' ' + k + '="' + escapeHtml_(v) + '"';
+      });
+      out += '>';
+      if (VOID_TAGS[tag]) return out;
+
+      var kids = children == null ? [] : (Array.isArray(children) ? children : [children]);
+      kids.forEach(function (c) {
+        if (c == null || c === false) return;
+        if (c && c.__raw !== undefined) { out += c.__raw; return; }
+        out += escapeHtml_(c);
+      });
+      return out + '</' + tag + '>';
+    }
+
+    function fdrClass_(d) { return 'fdr-' + (d || 0); }
+
+    var nullDataRetryCount = 0;
+    var MAX_NULL_DATA_RETRIES = 2;
+
+    function onData(data) {
+      // Confirmed reproducible in production, not a one-off: the Debug
+      // page's log has shown MULTIPLE separate requests that completed all
+      // 20 server-side stages successfully (~2-2.3s, no errors) while this
+      // page still received data === null. getDashboardData() has no code
+      // path that returns null — every branch ends in an explicit object
+      // return, and the server-side log proves the object WAS built. This
+      // looks like a google.script.run transport quirk this app's code
+      // can't directly fix. Since the server is proven fast and reliable
+      // every time, the pragmatic mitigation is to just ask it again —
+      // automatically, a couple of times, before bothering the user with an
+      // error for what's very likely a transient glitch.
+      if (!data) {
+        if (nullDataRetryCount < MAX_NULL_DATA_RETRIES) {
+          nullDataRetryCount++;
+          document.getElementById('app').innerHTML =
+            '<p class="muted">Server responded with no data — retrying (' + nullDataRetryCount + '/' + MAX_NULL_DATA_RETRIES + ')…</p>';
+          setTimeout(loadDashboard, 400);
+          return;
+        }
+        renderClientError_(new Error('Server call succeeded but returned no data (data was null), even after ' + MAX_NULL_DATA_RETRIES +
+          ' automatic retries. Ping test (near-instant, near-empty response) from this same load: ' + (lastPingResult || 'not resolved yet') +
+          ' — if that also failed or came back null, the cause is this page\'s calling context, not getDashboardData()\'s specific response. ' +
+          'This is not a normal application error — check the Debug page log for this request; if the TOTAL row for it is missing or shows an error, the server-side execution itself didn\'t complete cleanly despite the success callback firing.'));
+        return;
+      }
+
+      nullDataRetryCount = 0; // reset once a load actually succeeds
+      STATE.data = data;
+      // The RPC itself succeeding (this function running at all means it did)
+      // doesn't mean rendering succeeds — a bug in renderMasthead/renderApp
+      // throws INSIDE this success handler, which withFailureHandler never
+      // sees (that only catches RPC failures). Without this try/catch, that
+      // leaves the page stuck on the loading placeholder forever with zero
+      // indication anything went wrong — indistinguishable from the RPC
+      // itself hanging, which is exactly the failure mode this exists to
+      // rule out.
+      try {
+        renderMasthead(data);
+        renderApp(data);
+      } catch (err) {
+        renderClientError_(err);
+      }
+    }
+
+    function renderClientError_(err) {
+      document.getElementById('app').innerHTML =
+        '<p class="error-text">Data loaded successfully, but something broke while displaying it: ' + escapeHtml_(err.message || err) + '</p>' +
+        (err.stack ? '<pre class="muted" style="white-space:pre-wrap;font-size:11px;margin-top:var(--space-2);overflow-x:auto">' + escapeHtml_(err.stack) + '</pre>' : '') +
+        '<button onclick="loadDashboard()">Try again</button>';
+    }
+
+    function renderMasthead(data) {
+      if (data.needsSetup) {
+        document.getElementById('entryName').textContent = 'Setup required';
+        document.getElementById('entrySub').textContent = '';
+        return;
+      }
+      document.getElementById('entryName').textContent = data.entryName || 'Your team';
+      var headerInput = document.getElementById('teamIdInput');
+      if (headerInput && document.activeElement !== headerInput) headerInput.value = data.teamId || '';
+      var subBits = [];
+      if (data.managerName) subBits.push(data.managerName);
+      if (data.overallRank) subBits.push('Rank ' + Number(data.overallRank).toLocaleString());
+      if (data.squad && data.squad.teamValue != null) subBits.push('£' + data.squad.teamValue.toFixed(1) + 'm squad');
+      if (data.squad && data.squad.bank != null) subBits.push('£' + data.squad.bank.toFixed(1) + 'm in bank');
+      // Free transfers belong in the dateline, not buried in a section: it is
+      // the constraint every other recommendation on the page is written
+      // against, and it changes what "one more move" costs.
+      if (data.freeTransfers) subBits.push(data.freeTransfers + ' free transfer' + (data.freeTransfers === 1 ? '' : 's'));
+      document.getElementById('entrySub').textContent = subBits.join(' · ');
+      // Two clocks, named. The gameweek being PLAYED and the gameweek being
+      // PICKED FOR are usually different, and the masthead used to show one
+      // gameweek's number beside the other's deadline with nothing to say so.
+      var playing = data.liveGameweek ? data.liveGameweek.eventId : null;
+      var picking = data.pickingForEventId || data.currentEventId;
+      var gwEl = document.getElementById('gwLabel');
+      if (playing && picking && playing !== picking) {
+        gwEl.innerHTML = '<span class="clock-live">GW' + playing + ' being played' +
+          (data.liveGameweek.pointsSoFar != null ? ' · ' + data.liveGameweek.pointsSoFar + ' pts' : '') + '</span>';
+      } else if (picking) {
+        gwEl.textContent = 'GW ' + picking;
+      } else {
+        gwEl.textContent = 'Pre-season';
+      }
+      document.getElementById('sourceTag').textContent = (data.dataSource || 'Live') + (data.preseason ? ' · Preseason' : '');
+      document.getElementById('riskSelect').value = data.riskAppetite || 'balanced';
+
+      if (deadlineTimer) clearInterval(deadlineTimer);
+      // While a gameweek is being played, the countdown to the NEXT deadline
+      // is not what anyone is watching — how much of this one is left is.
+      // The clock carries the same mode the layout does.
+      var lg = data.liveGameweek;
+      if (lg && (lg.playersYetToPlay > 0 || lg.playersInPlay > 0)) {
+        var remaining = lg.playersYetToPlay + lg.playersInPlay;
+        document.getElementById('countdown').textContent =
+          remaining + ' still to come' + (lg.playersInPlay ? ' · ' + lg.playersInPlay + ' playing now' : '');
+        document.getElementById('deadlineLabel').textContent = data.deadline
+          ? 'Next deadline ' + new Date(data.deadline).toLocaleString()
+          : '';
+        return;
+      }
+      if (data.deadline) {
+        var deadlineDate = new Date(data.deadline);
+        document.getElementById('deadlineLabel').textContent =
+          'Picking for GW' + (data.pickingForEventId || '') + ' · deadline ' + deadlineDate.toLocaleString();
+        tickCountdown(deadlineDate);
+        deadlineTimer = setInterval(function () { tickCountdown(deadlineDate); }, 1000);
+      } else {
+        document.getElementById('deadlineLabel').textContent = '';
+        document.getElementById('countdown').textContent = '';
+      }
+    }
+
+    function tickCountdown(deadlineDate) {
+      var ms = deadlineDate.getTime() - Date.now();
+      var el = document.getElementById('countdown');
+      if (ms <= 0) { el.textContent = 'Deadline passed'; return; }
+      var d = Math.floor(ms / 86400000);
+      var h = Math.floor((ms % 86400000) / 3600000);
+      var m = Math.floor((ms % 3600000) / 60000);
+      var s = Math.floor((ms % 60000) / 1000);
+      el.textContent = (d > 0 ? d + 'd ' : '') + h + 'h ' + m + 'm ' + s + 's';
+    }
+
+    function renderApp(data) {
+      var app = document.getElementById('app');
+
+      if (data.needsSetup) {
+        app.innerHTML =
+          '<section class="setup-box">' +
+          '<div class="section-kicker">Connect your team</div>' +
+          '<p class="ruling-body" style="margin-bottom:var(--space-3)">Enter your FPL Team ID above and press Refresh, or here: ' +
+          'find it by logging into fantasy.premierleague.com, clicking "Points", and grabbing the number after <code>/entry/</code> in the URL.</p>' +
+          '<input type="text" id="teamIdInput2" placeholder="e.g. 1234567" inputmode="numeric">' +
+          '<button onclick="submitTeamId(\'teamIdInput2\')">Save &amp; load</button>' +
+          '<p class="error-text" id="setupError"></p>' +
+          '</section>';
+        return;
+      }
+
+      var html = '';
+      // Mode, not just content. With a gameweek in flight the live panel
+      // leads and the next deadline's advice follows it; otherwise the
+      // verdict leads as usual. Same sections, different order, decided by
+      // what the manager is most likely to have come here for.
+      var liveNow = !!data.liveGameweek;
+      if (liveNow) html += sectionLive(data);
+      html += sectionRuling(data);
+      // Directly under the verdict: what happened last time. The advice above
+      // reads very differently once you know whether last week worked.
+      if (!liveNow) html += sectionLastGameweek(data);
+
+      if (data.noSquadYet) {
+        html += sectionSuggestedSquad(data);
+        html += sectionMiniLeague(data);
+        html += sectionCompare(data);
+      } else {
+        // Tier 2 — what is going on: the squad the decisions apply to.
+        html += sectionSquad(data);
+        // Tier 3 — the working behind them, one closed row each.
+        html += sectionEvidence(data);
+      }
+      html += sectionAi(data);
+
+      app.innerHTML = html;
+
+      var leagueSelect = document.getElementById('leagueSelect');
+      if (leagueSelect) {
+        leagueSelect.addEventListener('change', function () {
+          google.script.run.withFailureHandler(function () {}).saveMiniLeagueId(this.value);
+          loadDashboard();
+        });
+      }
+
+      if (data.hasAiKey) {
+        renderChatLog();
+        var log = document.getElementById('chatLog');
+        if (log) log.scrollTop = log.scrollHeight;
+        // Fetched after the dashboard has rendered, so a slow transcript read
+        // never holds up the page. Only replaces what is on screen if there
+        // is actually something stored.
+        if (!STATE.chatHistory.length) loadChatHistory_();
+      }
+    }
+
+    /* ===================== SECTIONS ===================== */
+
+    function sectionRuling(data) {
+      var r = data.ruling || { headline: 'No verdict yet.', body: '' };
+      var html = '<section>';
+      html += '<div class="section-kicker">The Ruling</div>';
+      html += '<div class="ruling-headline">' + escapeHtml_(r.headline) + '</div>';
+      html += '<div class="ruling-body">' + escapeHtml_(r.body) + '</div>';
+      if (!data.noSquadYet) html += actionListHtml_(data);
+      if (data.lastGrade && data.lastGrade.summary) {
+        html += '<p class="muted" style="font-size:13px;margin-top:var(--space-3)">Self-grade — ' + escapeHtml_(data.lastGrade.summary) + '</p>';
+      }
+      html += articlesHtml_(data);
+      html += '</section>';
+      return html;
+    }
+
+    /* The one place that answers "so what do I actually do".
+     *
+     * This replaced three separate tellings of the same decisions: verdict
+     * columns, an article deck, and the Transfers / Lineup / Bench-order
+     * sections. Each figure carries its own window, because they are not
+     * the same unit — a transfer gain is points over six gameweeks, a
+     * lineup gain is points this week, a captain margin is the gap to the
+     * next-best option. The old page printed all three as bare "+N". */
+    function actionListHtml_(data) {
+      var a = data.actionList;
+      if (!a) return '';
+      var html = '<div class="do-now">';
+      html += '<div class="section-kicker">Do now' +
+        (data.pickingForEventId ? ' · for gameweek ' + data.pickingForEventId : '') + '</div>';
+      html += '<h2 class="do-now-headline">' + escapeHtml_(a.headline) + '</h2>';
+      html += '<p class="do-now-summary">' + escapeHtml_(a.summary) + '</p>';
+
+      if (!(a.actions || []).length) { html += '</div>'; return html; }
+
+      html += '<div class="actions">';
+      a.actions.forEach(function (act) {
+        html += '<div class="action">' +
+          '<div class="action-n">' + (act.n < 10 ? '0' : '') + act.n + '</div>' +
+          '<div class="action-body">' +
+            '<div class="action-title">' + escapeHtml_(act.title) + '</div>' +
+            '<div class="action-detail">' + escapeHtml_(act.detail) + '</div>' +
+          '</div>' +
+          '<div class="action-figure">' +
+            (act.figure != null
+              ? '<div class="action-figure-num">' + (act.figurePrefix || '') +
+                  Number(act.figure).toFixed(act.figureDecimals != null ? act.figureDecimals : 1) + '</div>' +
+                '<div class="action-figure-unit">' + escapeHtml_(act.figureUnit || '') + '</div>'
+              : '') +
+          '</div>' +
+          '<div class="action-tag">' +
+            (act.tag ? '<span class="pill ' + (act.tone === 'cool' ? 'pill-cool' : 'pill-warm') + '">' + escapeHtml_(act.tag) + '</span>' : '') +
+          '</div>' +
+        '</div>';
+      });
+      html += '</div>';
+      html += '<p class="caveat">Transfer gains are expected points over the lookahead window, so they compare directly against the 4 points a second transfer costs. Free-transfer count is estimated from your transfer history — the FPL API does not publish it.</p>';
+      html += '</div>';
+      return html;
+    }
+
+    /* --- Live gameweek: the page's peak-usage moment ---
+     *
+     * A manager's needs cycle hard by day. On deadline day the question is
+     * "what do I do"; on Saturday at 3pm it is "how am I doing"; on Tuesday
+     * it is planning. The data for the middle one existed, but the LAYOUT was
+     * identical in all three modes, so between Saturday lunchtime and Monday
+     * night — when this page gets looked at most — the thing being looked for
+     * sat in a card deck below next week's advice.
+     *
+     * When a gameweek is in flight this leads instead, and the advice for the
+     * next deadline follows it. Nothing new is fetched; it is the same
+     * `liveGameweek` object, given the position it earns.
+     */
+    function sectionLive(data) {
+      var g = data.liveGameweek;
+      if (!g) return '';
+
+      var moving = g.playersYetToPlay > 0 || g.playersInPlay > 0;
+      var html = '<section class="live-panel">';
+      html += '<div class="section-kicker live-kicker">' +
+        (moving ? '<span class="live-dot" aria-hidden="true"></span>Gameweek ' + g.eventId + ' in progress'
+                : 'Gameweek ' + g.eventId + ' \u2014 all played') + '</div>';
+
+      var vs = g.vsAverage;
+      html += '<h2 class="do-now-headline">' + g.pointsSoFar + ' points' +
+        (vs != null ? (vs >= 0 ? ', ' + vs + ' above the average' : ', ' + Math.abs(vs) + ' below the average') : '') +
+        '</h2>';
+
+      html += '<div class="stat-band">';
+      html += '<div><div class="stat-figure">' + g.pointsSoFar + '</div><div class="stat-label">Points so far' +
+        (g.average != null ? ', against a live average of ' + g.average : '') + '</div></div>';
+      if (moving) {
+        html += '<div><div class="stat-figure">' + (g.playersYetToPlay + g.playersInPlay) + '</div>' +
+          '<div class="stat-label">Still to come \u2014 ' + g.playersInPlay + ' playing now, ' +
+          g.playersYetToPlay + ' yet to start</div></div>';
+      }
+      if (g.captain) {
+        html += '<div><div class="stat-figure">' + g.captain.contributed + '</div>' +
+          '<div class="stat-label">From the armband \u2014 ' + escapeHtml_(g.captain.name) + ' on ' + g.captain.points +
+          (g.captain.multiplier > 1 ? ', doubled' : '') + '</div></div>';
+      }
+      html += '<div><div class="stat-figure">' + g.benchPoints + '</div><div class="stat-label">Sitting on your bench</div></div>';
+      html += '</div>';
+
+      var notes = [];
+      if (g.yetToPlayNames && g.yetToPlayNames.length) {
+        notes.push('Yet to play: ' + g.yetToPlayNames.join(', ') + '.');
+      }
+      if (g.autosubsAvailable) {
+        notes.push('A starter has finished without featuring, so autosubs will still come in \u2014 this score is not final.');
+      } else if (g.blanked && g.blanked.length) {
+        notes.push('Did not feature: ' + g.blanked.join(', ') + '.');
+      }
+      if (g.provisionalBonus) notes.push(g.provisionalBonus + ' of those points are provisional bonus, which can still move.');
+      if (g.top) notes.push('Best of your week so far: ' + g.top.name + ' on ' + g.top.points + '.');
+      if (g.complete) notes.push('Every fixture is done \u2014 this is your final score, once bonus is confirmed.');
+      if (notes.length) {
+        html += '<p class="ruling-body">' + escapeHtml_(notes.join(' ')) + '</p>';
+      }
+      html += '</section>';
+      return html;
+    }
+
+    /* The front page's second deck: short pieces, each a header and a finding.
+     * The verdict above answers what to do; these answer what is going on —
+     * the gameweek in flight, where free points are sitting, what the rank
+     * exposure is, what is coming. Every one is built server-side from
+     * sections the page already computes. */
+    function articlesHtml_(data) {
+      var list = data.articles || [];
+      if (!list.length) return '';
+      var html = '<div class="articles">';
+      list.forEach(function (a) {
+        html += '<article class="article">' +
+          '<div class="article-kicker">' + escapeHtml_(a.kicker) + '</div>' +
+          '<h3 class="article-headline">' + escapeHtml_(a.headline) + '</h3>';
+        if (a.figure) {
+          html += '<div class="article-figure">' + escapeHtml_(a.figure) + '</div>' +
+            (a.figureLabel ? '<div class="article-figure-label">' + escapeHtml_(a.figureLabel) + '</div>' : '');
+        }
+        html += '<p class="article-body">' + escapeHtml_(a.body) + '</p>' +
+          '</article>';
+      });
+      html += '</div>';
+      return html;
+    }
+
+    /* Built with `h` rather than string concatenation: every field here comes
+     * from the FPL API — names, club news written by a club's press office —
+     * and this row is rendered fifteen times a page. */
+    function playerRowHtml_(p, mark) {
+      // Every nested h() call returns an HTML STRING, and h()'s own child
+      // renderer treats a plain string as untrusted text and escapes it \u2014
+      // that is the entire point of escape-by-default. Which means every
+      // nested h() result handed to an outer h() as a child MUST be wrapped
+      // in raw(), or the inner markup gets escaped into visible tag soup.
+      // Three of these four were missing that wrap; only player-why had it,
+      // which is why only that one line ever rendered correctly.
+      return h('div', { 'class': 'player-row' + (mark ? ' player-row-' + mark.tone : '') }, [
+        raw(h('div', { 'class': 'pos' }, p.position)),
+        raw(h('div', { 'class': 'name' }, [
+          p.name,
+          p.isCaptain ? raw(h('span', { 'class': 'cap-mark' }, 'C')) : null,
+          p.isVice ? raw(h('span', { 'class': 'cap-mark' }, 'V')) : null,
+          mark ? raw(h('span', { 'class': 'row-mark row-mark-' + mark.tone },
+            mark.label + ' \u00b7 ' + (mark.n < 10 ? '0' : '') + mark.n)) : null
+        ])),
+        raw(h('div', { 'class': 'meta' },
+          p.team + ' \u00b7 \u00a3' + p.price.toFixed(1) + 'm' + (p.form != null ? ' \u00b7 form ' + p.form : '') +
+          (p.xp && p.xp.next != null ? ' \u00b7 ' + Number(p.xp.next).toFixed(1) + ' xP' : ''))),
+        p.reason ? raw(h('div', { 'class': 'player-why' }, p.reason)) : null
+      ]);
+    }
+
+    /* --- Transfers already made ---
+     *
+     * FPL only publishes a squad once its deadline passes, so between making
+     * a transfer and the deadline the server is reading last week's team.
+     * This is where the manager tells it what they did; the server applies
+     * it to every figure on the page (see saveDeclaredTransfers). */
+    var DECL_IN_MAP = {};
+
+    function declaredHtml_(data) {
+      var gw = data.pickingForEventId;
+      if (gw == null || !(data.transferBase || []).length) return '';
+      var d = data.declared;
+      var html = '<div class="declare">';
+      html += '<div class="section-kicker">Transfers you have already made for GW' + gw + '</div>';
+      if (data.declaredCheck) html += '<p class="muted">' + escapeHtml_(data.declaredCheck.note) + '</p>';
+      if (data.declaredError) {
+        html += '<p class="error-text">Your saved transfers could not be applied, so this page is showing your last locked squad: ' +
+          escapeHtml_(data.declaredError) + '</p>';
+      }
+      if (d && (d.moves || []).length) {
+        d.moves.forEach(function (m) {
+          html += '<div class="list-row"><span class="name">' + escapeHtml_(m.inName) +
+            ' <span class="meta">' + escapeHtml_(m.inTeam + ' ' + m.position) + ' in for ' + escapeHtml_(m.outName) +
+            (m.priceDelta ? ' &middot; ' + (m.priceDelta > 0 ? 'costs' : 'frees') + ' £' + Math.abs(m.priceDelta).toFixed(1) + 'm' : '') +
+            '</span></span>' +
+            '<button class="pill pill-btn" onclick="removeDeclaredMove(' + Number(m.outId) + ')">Remove</button></div>';
+        });
+        html += '<p class="muted" style="font-size:13px;margin-top:var(--space-2)">' +
+          (d.chip ? escapeHtml_(d.chip) + ' active, so these are free. '
+            : (d.hits ? '−' + (d.hits * 4) + ' points of hits. ' : 'No hit. ') +
+              d.freeTransfersLeft + ' free transfer' + (d.freeTransfersLeft === 1 ? '' : 's') + ' left. ') +
+          '£' + d.bank.toFixed(1) + 'm in the bank. Everything on this page is for this squad.</p>';
+      } else {
+        html += '<p class="ruling-body" style="margin-bottom:var(--space-2)">FPL does not show a transfer until the deadline passes, ' +
+          'so until then this page is reading last week’s squad. Made a move already? Add it here and the eleven, the captain ' +
+          'and every remaining suggestion are redone for the squad you hold now.</p>';
+      }
+      var opts = (data.transferBase || []).slice().sort(function (a, b) { return a.elementType - b.elementType; })
+        .map(function (p) { return '<option value="' + Number(p.id) + '">' + escapeHtml_(p.position + ' · ' + p.name) + '</option>'; }).join('');
+      html += '<div class="declare-form">' +
+        '<label>Sold <select id="declOut" onchange="fillDeclaredIn()"><option value="">Choose a player</option>' + opts + '</select></label>' +
+        '<label>Bought <input id="declIn" list="declInList" placeholder="Pick who you sold first" autocomplete="off"></label>' +
+        '<datalist id="declInList"></datalist>' +
+        '<label>Chip <select id="declChip"><option value="">None</option><option value="wildcard"' + (d && d.chip === 'Wildcard' ? ' selected' : '') +
+          '>Wildcard</option><option value="freehit"' + (d && d.chip === 'Free Hit' ? ' selected' : '') + '>Free Hit</option></select></label>' +
+        '<button class="btn" id="declAddBtn" onclick="addDeclaredMove()">Add transfer</button>' +
+        (d && (d.moves || []).length ? '<button class="pill pill-btn" onclick="clearDeclared()">Clear all</button>' : '') +
+        '</div><p class="error-text" id="declError"></p>';
+      html += '</div>';
+      return html;
+    }
+
+    /* Only players at the sold player's position: transfers are like for like. */
+    function fillDeclaredIn() {
+      var outId = Number(document.getElementById('declOut').value);
+      var base = (STATE.data.transferBase || []).filter(function (p) { return p.id === outId; })[0];
+      var list = document.getElementById('declInList');
+      var input = document.getElementById('declIn');
+      DECL_IN_MAP = {};
+      if (!base) { list.innerHTML = ''; input.placeholder = 'Pick who you sold first'; return; }
+      var owned = {};
+      (STATE.data.squad ? STATE.data.squad.players : []).forEach(function (p) { owned[p.id] = true; });
+      var html = '';
+      (STATE.data.playerIndex || []).forEach(function (r) {
+        // [id, name, club, position, price, status]
+        if (r[3] !== base.position || owned[r[0]]) return;
+        var label = r[1] + ' — ' + r[2] + ' £' + Number(r[4]).toFixed(1) + 'm';
+        DECL_IN_MAP[label] = r[0];
+        html += '<option value="' + escapeHtml_(label) + '"></option>';
+      });
+      list.innerHTML = html;
+      input.value = '';
+      input.placeholder = 'Search ' + base.position + 's';
+    }
+
+    function declaredMoves_() {
+      var d = STATE.data.declared;
+      return d && d.moves ? d.moves.map(function (m) { return { outId: m.outId, inId: m.inId }; }) : [];
+    }
+
+    function saveDeclared_(moves, chip) {
+      var err = document.getElementById('declError');
+      var btn = document.getElementById('declAddBtn');
+      if (btn) btn.disabled = true;
+      if (err) err.textContent = '';
+      google.script.run
+        .withSuccessHandler(function () { loadDashboard(); })
+        .withFailureHandler(function (e) {
+          if (btn) btn.disabled = false;
+          if (err) err.textContent = e.message || e;
+        })
+        .saveDeclaredTransfers(JSON.stringify({ eventId: STATE.data.pickingForEventId, moves: moves, chip: chip || null }));
+    }
+
+    function addDeclaredMove() {
+      var outId = Number(document.getElementById('declOut').value);
+      var inId = DECL_IN_MAP[document.getElementById('declIn').value];
+      var err = document.getElementById('declError');
+      if (!outId) { err.textContent = 'Choose the player you sold.'; return; }
+      if (!inId) { err.textContent = 'Choose the player you bought from the list.'; return; }
+      // Relative to the locked squad: selling someone bought earlier this week
+      // is folded into one move on the server (mergeDeclaredMove_).
+      saveDeclared_(declaredMoves_().concat([{ outId: outId, inId: inId }]), document.getElementById('declChip').value);
+    }
+
+    function removeDeclaredMove(outId) {
+      var d = STATE.data.declared;
+      saveDeclared_(declaredMoves_().filter(function (m) { return m.outId !== outId; }),
+        d && d.chip ? (d.chip === 'Wildcard' ? 'wildcard' : 'freehit') : null);
+    }
+
+    function clearDeclared() {
+      google.script.run.withSuccessHandler(function () { loadDashboard(); })
+        .clearDeclaredTransfers(STATE.data.pickingForEventId);
+    }
+
+    /* The best eleven and captain for each gameweek of the plan. This week
+     * is the firm call (the eleven above, with the simulated captain); later
+     * weeks follow the transfer plan and are provisional. */
+    function xiByGwHtml_(data) {
+      var r = data.roadmap;
+      var weeks = r && r.weeks ? r.weeks.slice(1).filter(function (w) { return w.xi; }) : [];
+      if (!weeks.length) return '';
+      var html = '<details class="evi xi-gw"><summary class="evi-head"><span class="evi-title">Best eleven, gameweek by gameweek' +
+        '<span class="evi-blurb">The eleven and captain each later week of the plan implies.</span></span>' +
+        '<span class="evi-summary">next ' + weeks.length + ' GWs</span><span class="evi-mark" aria-hidden="true"></span></summary><div class="evi-body">';
+      weeks.forEach(function (w) {
+        var xi = w.xi;
+        html += '<div class="list-row"><span class="name">GW' + w.event + ' <span class="meta">' + escapeHtml_(xi.formation) +
+          ' &middot; ' + xi.total.toFixed(1) + ' xP' + (xi.captain ? ' &middot; captain ' + escapeHtml_(xi.captain.name) : '') +
+          (xi.vice ? ', vice ' + escapeHtml_(xi.vice.name) : '') + '</span></span>' +
+          '<span class="pill pill-warm">Provisional</span></div>';
+        if ((w.moves || []).length) {
+          html += '<div class="player-why">After ' + escapeHtml_(w.moves.map(function (m) { return m.inName + ' in for ' + m.outName; }).join(', ')) + '.</div>';
+        }
+        html += '<div class="player-why">' + ['GKP', 'DEF', 'MID', 'FWD'].map(function (pos) {
+          return xi.players.filter(function (p) { return p.position === pos; }).map(function (p) { return escapeHtml_(p.name); }).join(', ');
+        }).join(' &middot; ') + '</div>';
+      });
+      html += '<p class="caveat">Each later week assumes the plan in Evidence is followed and nobody new is injured, so read it as a shape rather than a team sheet. ' +
+        'Its captain is the highest projection in that eleven; this week’s captain above comes from the full simulation.</p>';
+      html += '</div></details>';
+      return html;
+    }
+
+    /* The squad, with the decisions marked ON it.
+     *
+     * "Switch to 4-5-1" used to be its own section three below the squad
+     * list it was talking about, and the bench order a fourth — so reading
+     * the advice meant holding a formation in your head while scrolling
+     * back to find the players. The marks now sit on the rows themselves,
+     * keyed to the numbered action that produced them. */
+    function sectionSquad(data) {
+      var s = data.squad;
+      var l = data.lineup;
+      var marks = (data.actionList && data.actionList.marks) || {};
+      var caps = data.captainSuggestions || [];
+      var capName = caps[0] ? caps[0].name : null, viceName = caps[1] ? caps[1].name : null;
+
+      // Who the lineup call moves, by name — the changes carry names, not ids.
+      var startNames = {}, benchNames = {};
+      if (l && l.markN) {
+        (l.changes || []).forEach(function (c) {
+          startNames[c.inName] = l.markN;
+          benchNames[c.outName] = l.markN;
+        });
+        (l.formationIn || []).forEach(function (p) { startNames[p.name] = l.markN; });
+        (l.formationOut || []).forEach(function (p) { benchNames[p.name] = l.markN; });
+      }
+      function markFor(p) {
+        if (marks[p.id]) return { label: 'Out', n: marks[p.id].n, tone: 'out' };
+        if (startNames[p.name]) return { label: 'Start', n: startNames[p.name], tone: 'in' };
+        if (benchNames[p.name]) return { label: 'Bench', n: benchNames[p.name], tone: 'out' };
+        return null;
+      }
+      /* The armband shown is the RECOMMENDED one. Showing the manager's own
+       * C and V on the list of the eleven to play — next to a different
+       * recommended captain — is how the page came to show two captains. */
+      function withArmband(p) {
+        var c = {}; Object.keys(p).forEach(function (k) { c[k] = p[k]; });
+        c.isCaptain = capName != null ? p.name === capName : p.isCaptain;
+        c.isVice = viceName != null ? p.name === viceName : p.isVice;
+        return c;
+      }
+
+      var html = '<section><div class="section-heading">Your squad' +
+        (data.pickingForEventId ? ' for gameweek ' + data.pickingForEventId : '') + '</div>';
+      html += declaredHtml_(data);
+      if (l && (l.xiWarnings || []).length) {
+        // Players who cannot play first, as a callout; doubts and rotation
+        // underneath as plain notes — one needs action, the others inform.
+        html += '<div class="xi-warnings">';
+        l.xiWarnings.filter(function (w) { return w.severity === 'unavailable'; }).forEach(function (w) {
+          html += '<p class="urgent-price"><strong>Cannot play.</strong> ' + escapeHtml_(w.text) + '</p>';
+        });
+        l.xiWarnings.filter(function (w) { return w.severity !== 'unavailable'; }).forEach(function (w) {
+          html += '<p class="muted" style="font-size:13.5px"><strong>' + (w.severity === 'rotation' ? 'Rotation.' : 'Doubt.') +
+            '</strong> ' + escapeHtml_(w.text) + '</p>';
+        });
+        html += '</div>';
+      }
+
+      /* One list: the eleven to PLAY, in full detail, then the bench in
+       * autosub order. It used to be two — a compact team sheet of the
+       * recommendation and, below it, the eleven that was set with its own
+       * captain — and reading the page meant reconciling them. Anyone the
+       * recommendation moves is marked on their row instead. */
+      var byId = {};
+      s.players.forEach(function (p) { byId[p.id] = p; });
+      var xi = l && (l.xi || []).length
+        ? l.xi.map(function (x) { return byId[x.id]; }).filter(Boolean)
+        : s.starting.slice();
+      xi.sort(function (a, b) { return a.elementType - b.elementType || (b.xp ? b.xp.next : 0) - (a.xp ? a.xp.next : 0); });
+      var inXi = {};
+      xi.forEach(function (p) { inXi[p.id] = true; });
+
+      html += '<div class="section-kicker">' + (l ? 'Play this eleven &middot; ' + escapeHtml_(l.formation) + ' &middot; ' +
+        l.projected.toFixed(1) + ' xP' + (l.gain > 0.05 ? ' (the eleven you have set: ' + l.currentProjected.toFixed(1) + ')' : '')
+        : 'Starting eleven') + '</div>';
+      xi.forEach(function (p) { html += playerRowHtml_(withArmband(p), markFor(p)); });
+
+      var setCaptain = s.starting.filter(function (p) { return p.isCaptain; })[0];
+      if (capName && setCaptain && setCaptain.name !== capName) {
+        html += '<p class="muted" style="font-size:13px;margin-top:var(--space-2)">Your armband is on ' + escapeHtml_(setCaptain.name) +
+          '; the recommendation is ' + escapeHtml_(capName) + (viceName ? ', with ' + escapeHtml_(viceName) + ' as vice' : '') + '.</p>';
+      }
+
+      html += '<div class="section-kicker" style="margin-top:var(--space-6)">Bench &middot; autosubs come on in this order</div>';
+      var bench = s.players.filter(function (p) { return !inXi[p.id]; });
+      if (l && (l.benchOrder || []).length) {
+        var rank = {};
+        l.benchOrder.forEach(function (b) { rank[b.name] = b.order; });
+        if (l.benchGk) rank[l.benchGk.name] = 99;
+        bench.sort(function (x, y) { return (rank[x.name] || 50) - (rank[y.name] || 50); });
+      }
+      bench.forEach(function (p) { html += playerRowHtml_(withArmband(p), markFor(p)); });
+
+      html += xiByGwHtml_(data);
+      html += '</section>';
+      return html;
+    }
+
+    function sectionSuggestedSquad(data) {
+      var sq = data.suggestedSquad;
+      var html = '<section><div class="section-kicker">Suggested squad</div>';
+      html += '<div class="ruling-body" style="margin-bottom:var(--space-2)">£' + sq.totalSpend.toFixed(1) + 'm spent · £' + sq.remaining.toFixed(1) + 'm remaining · ' + sq.players.length + ' players</div>';
+      if (data.suggestedSquadBasis === 'last-season') {
+        html += '<p class="muted" style="font-size:13px;margin-bottom:var(--space-4)">Ranked on last season\'s numbers — this season\'s form and projected points read zero for everyone until GW1 kicks off. Preseason friendlies aren\'t tracked by the official FPL API, so they can\'t factor in.</p>';
+      }
+      sq.players.forEach(function (p) { html += playerRowHtml_(p); });
+      html += '</section>';
+      return html;
+    }
+
+    function sectionTransfers(data) {
+      var html = '<section><div class="section-heading">Transfers</div>';
+      var plan = data.transferPlan;
+      if (plan) {
+        html += '<div class="ruling-body" style="margin-bottom:var(--space-3)"><strong>' + escapeHtml_(plan.headline) + '</strong> ' +
+          escapeHtml_(plan.detail) + '</div>';
+      }
+      var list = data.transferSuggestions || [];
+      if (!list.length) {
+        html += '<p class="muted">No move clears the bar this week — ' +
+          (data.freeTransfers > 1
+            ? 'you already have ' + data.freeTransfers + ' free transfers banked.'
+            : 'bank the transfer and take two moves next week instead.') + '</p>';
+      } else {
+        list.forEach(function (t) {
+          var figure = t.netGain != null ? t.netGain : t.projectedGain;
+          html += '<div class="rec-row"><div>' +
+            '<div class="rec-out"><span class="lbl">Out</span>' + escapeHtml_(t.out) + '</div>' +
+            '<div class="rec-reason">' + escapeHtml_(t.outReason) + '</div>' +
+            '<div class="rec-in"><span class="lbl">In</span>' + escapeHtml_(t.into) + '</div>' +
+            '<div class="rec-reason">' + escapeHtml_(t.intoReason) + '</div>' +
+            (t.xiNote ? '<div class="rec-reason">' + escapeHtml_(t.xiNote) +
+              (t.gainLater != null ? ' +' + t.gainLater.toFixed(1) + ' over the gameweeks after.' : '') + '</div>' : '') +
+            (t.usesHit && t.waitCost != null
+              ? '<div class="rec-reason">Worth the hit now: waiting for next week\u2019s free transfer would cost ' + t.waitCost.toFixed(1) + '.</div>' : '') +
+            (t.counterfactual ? '<div class="rec-reason">' + escapeHtml_(t.counterfactual) + '</div>' : '') +
+            (t.implausible ? '<div class="rec-reason"><strong>Check this one.</strong> More than 4.5 points a week from one swap usually means the incoming projection is inflated.</div>' : '') +
+            (t.usesHit
+              ? '<div class="rec-reason">Costs a −4 hit. Gains ' + t.projectedGain.toFixed(1) +
+                ' pts gross over ' + t.horizonGws + ' gameweeks, so it still nets ' + t.netGain.toFixed(1) + '.</div>'
+              : '') +
+            '</div><div class="rec-right">' +
+            '<div class="rec-figure">' + (figure >= 0 ? '+' : '') + Number(figure).toFixed(1) + '</div>' +
+            '<div class="rec-caption">' + (t.usesHit ? 'Net pts after the hit' : 'Projected pts, next ' + t.horizonGws + ' GWs') + '</div>' +
+            '<div class="pill ' + (t.confidence === 'High' ? 'pill-cool' : 'pill-warm') + '" style="margin-top:8px">' + t.confidence + '</div>' +
+            '<div class="rec-cost">' + escapeHtml_(t.costLine) + '</div>' +
+            '</div></div>';
+        });
+      }
+      (data.deferredTransfers || []).forEach(function (dm) {
+        html += '<div class="list-row"><span class="name">' + escapeHtml_((dm.makeInEvent ? 'GW' + dm.makeInEvent + ': ' : 'Next week: ') +
+          dm.inName + ' in for ' + dm.outName) + ' <span class="meta">' + escapeHtml_(dm.note) + '</span></span>' +
+          '<span class="pill pill-cool">Wait</span></div>';
+      });
+      html += '<p class="caveat">Gains are expected points over the next ' +
+        ((list[0] && list[0].horizonGws) || 6) + ' gameweeks, so they are directly comparable to the 4 points a second ' +
+        'transfer costs. Free-transfer count is estimated from your transfer history — the FPL API does not publish it.</p>';
+      html += '</section>';
+      return html;
+    }
+
+    /* Tier 3 — the working.
+     *
+     * Thirteen sections at identical visual weight is not a hierarchy, and
+     * most of them are reference rather than decisions: on a quiet week the
+     * page still gave a full-width heading to an empty price watch. Each is
+     * a closed row now, carrying the one figure that would make you open
+     * it. Native <details> so it is keyboard-accessible and needs no state
+     * of its own. */
+    function sectionEvidence(data) {
+      var rows = [];
+
+      function row(title, blurb, summary, body) {
+        if (!body) return;
+        rows.push(
+          '<details class="evi">' +
+            '<summary class="evi-head">' +
+              '<span class="evi-title">' + escapeHtml_(title) +
+                '<span class="evi-blurb">' + escapeHtml_(blurb) + '</span></span>' +
+              '<span class="evi-summary">' + (summary || '') + '</span>' +
+              '<span class="evi-mark" aria-hidden="true"></span>' +
+            '</summary>' +
+            '<div class="evi-body">' + body + '</div>' +
+          '</details>');
+      }
+
+      var t = (data.transferSuggestions || [])[0];
+      row('Transfers', 'Every move considered, with the arithmetic.',
+        t ? '<span class="delta-rise">+' + t.projectedGain.toFixed(1) + '</span> on the top move'
+          : 'Nothing clears the bar',
+        sectionTransfers(data));
+
+      var r = data.roadmap;
+      var firstMove = r && (r.weeks || []).filter(function (w) { return w.moves.length; })[0];
+      row('The ' + ((r && r.horizonGws) || 6) + '-gameweek plan', 'What to do each week, and when to bank instead.',
+        r && r.divergence
+          ? '<span class="delta-fall">' + r.divergence.gain.toFixed(1) + ' pts</span> says wait'
+          : (firstMove ? 'Next move GW' + firstMove.event : 'Bank for now'),
+        sectionRoadmap(data));
+
+      var fg = data.fixtureGrid;
+      row('Fixture difficulty', 'Your clubs only, opponent by opponent.',
+        fg && fg.eventIds ? 'GW' + fg.eventIds[0] + '–GW' + fg.eventIds[fg.eventIds.length - 1] : '',
+        sectionFixtures(data));
+
+      // Rank risk answers one question at two resolutions: the whole game's
+      // template (always available) and the actual league being played in
+      // (only once rivals' picks unlock). The league read is the sharper of
+      // the two, so it leads the row and supplies the headline figure.
+      var o = data.ownershipEdge;
+      var eo = data.leagueEo;
+      var eoLive = eo && !eo.unavailable;
+      row('Rank risk', eoLive
+            ? 'Effective ownership in your league, then the game-wide template.'
+            : 'The template you do not own, and the differentials you do.',
+        eoLive
+          ? '<span class="' + (eo.net >= 0 ? 'delta-rise' : 'delta-fall') + '">' +
+              (eo.net >= 0 ? '+' : '') + eo.net.toFixed(1) + '</span> vs the field'
+          : (o && o.exposure != null ? '<span class="delta-fall">' + o.exposure.toFixed(1) + ' pts</span> exposed' : ''),
+        sectionLeagueEo(data) + sectionOwnership(data));
+
+      var chip = (data.chipBoard || []).filter(function (c) {
+        return c.status === 'Play now' || String(c.status).indexOf('Target') === 0;
+      })[0];
+      row('Chips', 'All five, priced in points, with what each is waiting for.',
+        chip
+          ? escapeHtml_(chip.label + ' · ' + chip.status) +
+            (chip.value != null ? ' <span class="delta-rise">' + chip.value.toFixed(1) + ' pts</span>' : '')
+          : 'All held',
+        sectionChips(data));
+
+      var p = data.priceWatch || {};
+      var moving = (p.targets || []).length + (p.squad || []).length;
+      var rw = (data.riskWatch || []).length;
+      row('Price and availability', 'What is about to move, and anyone carrying a flag.',
+        p.urgent
+          ? '<span class="delta-rise">' + escapeHtml_(p.urgent.name) + ' rising</span> \u2014 buy tonight'
+          : (moving || rw
+              ? (moving + ' under pressure \u00b7 ' + rw + ' flagged')
+              : 'Nothing moving'),
+        sectionPriceAndRisk(data));
+
+      var g = data.lastGameweek;
+      row('Gameweek ' + (g ? g.eventId : '') + ' review', 'What worked last time out, and what did not.',
+        g && g.points != null ? g.points + ' pts' : '',
+        g ? sectionLastGameweek(data) : '');
+
+      var tr = data.trackRecord;
+      row('Our track record', 'Every past call, graded against what happened.',
+        tr ? tr.gwsGraded + ' gameweek' + (tr.gwsGraded === 1 ? '' : 's') + ' graded' : '',
+        sectionTrackRecord(data));
+
+      var cal = data.calibration;
+      row('Model calibration', 'Projected points against what actually happened.',
+        cal && cal.predicted
+          ? (function () {
+              var off = ((cal.actual - cal.predicted) / cal.predicted) * 100;
+              return '<span class="' + (Math.abs(off) < 3 ? 'delta-rise' : 'delta-fall') + '">' +
+                (off >= 0 ? '+' : '') + off.toFixed(0) + '%</span> off';
+            })()
+          : '',
+        sectionCalibration(data));
+
+      row('Mini-league', 'Where you sit, and who is moving.', '', sectionMiniLeague(data));
+      row('How this compares', 'Why this beats the way you played before.', '', sectionCompare(data));
+
+      if (!rows.length) return '';
+      return '<section><div class="section-heading">Evidence</div>' +
+        '<p class="ruling-body">Everything the decisions above were derived from. Open a row for the working.</p>' +
+        '<div class="evidence">' + rows.join('') + '</div></section>';
+    }
+
+    /* --- Last gameweek: what worked, what did not --- */
+    function sectionLastGameweek(data) {
+      var g = data.lastGameweek;
+      if (!g) return '';
+      var html = '<section><div class="section-heading">Gameweek ' + g.eventId + ' review</div>';
+
+      html += '<div class="stat-band">';
+      if (g.points != null) {
+        html += '<div><div class="stat-figure">' + g.points + '</div><div class="stat-label">Points' +
+          (g.average != null ? ' — the gameweek average was ' + g.average : '') + '</div></div>';
+      }
+      if (g.vsAverage != null) {
+        html += '<div><div class="stat-figure">' + (g.vsAverage >= 0 ? '+' : '') + g.vsAverage +
+          '</div><div class="stat-label">Against the average' + (g.highest ? '; the top score was ' + g.highest : '') + '</div></div>';
+      }
+      if (g.rankDelta != null) {
+        html += '<div><div class="stat-figure">' + (g.rankDelta > 0 ? '+' : '') + Math.abs(g.rankDelta).toLocaleString() +
+          '</div><div class="stat-label">Places ' + (g.rankDelta > 0 ? 'gained' : 'lost') +
+          (g.overallRank ? ', now ' + Number(g.overallRank).toLocaleString() : '') + '</div></div>';
+      }
+      if (g.benchPoints != null) {
+        html += '<div><div class="stat-figure">' + g.benchPoints + '</div><div class="stat-label">Points left on your bench</div></div>';
+      }
+      html += '</div>';
+
+      html += '<div class="two-col">';
+      html += '<div><div class="section-kicker">What worked</div>';
+      if (!(g.worked || []).length) {
+        html += '<p class="muted">Nothing stood out as a win this week.</p>';
+      } else {
+        g.worked.forEach(function (line) {
+          html += '<div class="list-row"><span class="name" style="font-weight:400">' + escapeHtml_(line) + '</span></div>';
+        });
+      }
+      html += '</div>';
+
+      html += '<div><div class="section-kicker">What did not</div>';
+      if (!(g.didntWork || []).length) {
+        html += '<p class="muted">Nothing went wrong worth flagging — a clean week.</p>';
+      } else {
+        g.didntWork.forEach(function (line) {
+          html += '<div class="list-row"><span class="name" style="font-weight:400">' + escapeHtml_(line) + '</span></div>';
+        });
+      }
+      html += '</div></div>';
+
+      if (g.captain) {
+        html += '<div class="section-kicker" style="margin-top:var(--space-4)">The armband</div>';
+        html += '<div class="list-row"><span class="name">' + escapeHtml_(g.captain.name) +
+          ' <span class="meta">' + escapeHtml_(g.captain.team) + '</span>' +
+          (g.captain.multiplier > 2 ? ' <span class="meta">Triple Captain</span>' : '') + '</span>' +
+          '<span class="' + (g.captain.wasBest ? 'delta-rise' : 'meta') + '">' + g.captain.points +
+          ' × ' + g.captain.multiplier + ' = ' + pts_(g.captain.contributed) + '</span></div>';
+        if (g.captain.best && !g.captain.wasBest) {
+          html += '<div class="list-row"><span class="name" style="font-weight:400">Best option in your XI was ' +
+            escapeHtml_(g.captain.best.name) + ' (' + pts_(g.captain.best.points) + ')</span>' +
+            '<span class="delta-fall">−' + g.captain.pointsLeft + ' pts</span></div>';
+        }
+      }
+
+      if (g.transfers && g.transfers.count > 0 && g.transfers.net != null) {
+        html += '<div class="section-kicker" style="margin-top:var(--space-4)">Transfers made</div>';
+        (g.transfers.inPlayers || []).forEach(function (p, i) {
+          var out = (g.transfers.outPlayers || [])[i];
+          html += '<div class="list-row"><span class="name">' + escapeHtml_(p.name) + ' <span class="meta">in, ' + pts_(p.points) + '</span>' +
+            (out ? ' &middot; ' + escapeHtml_(out.name) + ' <span class="meta">out, ' + pts_(out.points) + '</span>' : '') + '</span>' +
+            (out ? '<span class="' + (p.points >= out.points ? 'delta-rise' : 'delta-fall') + '">' +
+              (p.points - out.points >= 0 ? '+' : '') + (p.points - out.points) + '</span>' : '') + '</div>';
+        });
+        html += '<div class="list-row"><span class="name">Net after ' +
+          (g.transfers.cost ? 'the −' + g.transfers.cost + ' hit' : 'no hit') + '</span>' +
+          '<span class="' + (g.transfers.net >= 0 ? 'delta-rise' : 'delta-fall') + '">' +
+          (g.transfers.net >= 0 ? '+' : '') + g.transfers.net + ' pts</span></div>';
+      }
+
+      html += '</section>';
+      return html;
+    }
+
+    /* --- Transfer roadmap: week on week, not just this week --- */
+    function sectionRoadmap(data) {
+      var r = data.roadmap;
+      if (!r || !(r.weeks || []).length) return '';
+      var html = '<section><div class="section-heading">The next ' + r.horizonGws + ' gameweeks</div>';
+      html += '<div class="ruling-body" style="margin-bottom:var(--space-4)">' +
+        (r.totalPlannedMoves
+          ? '<strong>' + r.totalPlannedMoves + ' move' + (r.totalPlannedMoves === 1 ? '' : 's') + ' planned' +
+            (r.totalHits ? ', ' + (r.totalHits * 4) + ' points of hits' : '') + '.</strong> ' +
+            'This is a whole plan, not a run of separate decisions: rolling competes against moving on the same arithmetic, ' +
+            'and every week is scored on the best legal eleven you could field rather than the squad total.'
+          : '<strong>Nothing planned yet.</strong> Banking transfers beats every move on the board over this window.') +
+        (r.plannedXp != null
+          ? ' <span class="meta">The plan projects <strong>' + r.plannedXp.toFixed(1) + '</strong> points across the window, after hits.</span>'
+          : '') +
+        '</div>';
+
+      // The lookahead's own finding when it disagrees with the single-week
+      // engine. Deliberately not a second recommendation — the action list is
+      // the app's answer, and two competing instructions on one page is the
+      // bug this section was rebuilt to remove. It is reported as a cost.
+      if (r.divergence) {
+        html += '<div class="urgent-price"><strong>The horizon disagrees.</strong> ' +
+          escapeHtml_(r.divergence.summary) + '</div>';
+      }
+
+      r.weeks.forEach(function (w) {
+        html += '<div class="list-row"><span class="name">GW' + w.event +
+          ' <span class="meta">' + w.freeTransfers + ' free transfer' + (w.freeTransfers === 1 ? '' : 's') +
+          ' &middot; squad projects ' + w.squadXp.toFixed(1) + ' pts</span></span>' +
+          '<span class="pill ' + (w.action === 'transfer' ? 'pill-cool' : 'pill-warm') + '">' +
+          (w.action === 'transfer'
+            ? (w.hits ? 'Transfer −' + (w.hits * 4) : 'Transfer')
+            : 'Roll') + '</span></div>';
+        w.moves.forEach(function (m) {
+          html += '<div class="player-why">' + escapeHtml_(m.inName + ' (' + m.inTeam + ', £' + m.price.toFixed(1) + 'm) in for ' + m.outName) +
+            ' — <span class="delta-rise">+' + m.gain.toFixed(1) + ' pts</span> over the rest of the window.</div>';
+        });
+        if (w.note) html += '<div class="player-why">' + escapeHtml_(w.note) + '</div>';
+      });
+
+      if ((r.fixtureSwings || []).length) {
+        html += '<div class="section-kicker" style="margin-top:var(--space-5)">When your clubs turn</div>';
+        html += '<p class="muted" style="font-size:13px;margin-bottom:var(--space-2)">Average fixture difficulty over the first half of the window against the second — this is what decides <em>when</em> a move is worth making, not just whether.</p>';
+        r.fixtureSwings.forEach(function (s) {
+          html += '<div class="list-row"><span class="name">' + escapeHtml_(s.club) +
+            ' <span class="meta">' + escapeHtml_(s.players.join(', ')) + '</span></span>' +
+            '<span class="' + (s.direction === 'easier' ? 'delta-rise' : 'delta-fall') + '">' +
+            s.before.toFixed(1) + ' &rarr; ' + s.after.toFixed(1) + ' from GW' + s.turnsAt + '</span></div>';
+        });
+      }
+
+      html += '<p class="caveat">This is a bounded search, not an optimal one. Every gameweek, each surviving plan branches into rolling, ' +
+        'taking the best available move, or taking two and paying the hit; plans are ranked on the expected points of the best legal eleven ' +
+        'across the whole window, and the top ' + (r.beamWidth || 6) + ' carry forward. Candidates are pruned to the ' +
+        (r.poolPerPosition || 30) + ' best players per position — a true optimum is an integer program over every player and every remaining ' +
+        'gameweek, which no page load has time for. It assumes prices hold and no new injuries, both of which will change, so read it again each week ' +
+        'rather than committing to it.</p>';
+      html += '</section>';
+      return html;
+    }
+
+    /* --- Effective ownership: the field you are actually being scored against ---
+     *
+     * Global ownership answers "how many people own him". The question that
+     * decides rank is "how many of the people I am playing against have him
+     * on the pitch, and how many of those captained him" — which is a
+     * different number, and often a much larger one. Every row here is
+     * computed from rivals' real picks, so the captaincy column is exact
+     * rather than inferred. */
+    function sectionLeagueEo(data) {
+      var e = data.leagueEo;
+      if (!e) return '';
+      if (e.unavailable) {
+        return '<section><div class="section-heading">Effective ownership</div>' +
+          '<p class="muted">' + escapeHtml_(e.unavailable) + '</p></section>';
+      }
+
+      var html = '<section><div class="section-heading">Effective ownership — ' + escapeHtml_(e.leagueName) + '</div>';
+      html += '<div class="ruling-body" style="margin-bottom:var(--space-4)">' + escapeHtml_(e.summary) + '</div>';
+
+      html += '<div class="stat-band">';
+      html += '<div><div class="stat-figure">' + (e.net >= 0 ? '+' : '') + e.net.toFixed(1) + '</div>' +
+        '<div class="stat-label">Net exposure against the field, in expected points this gameweek</div></div>';
+      html += '<div><div class="stat-figure">' + e.downside.toFixed(1) + '</div>' +
+        '<div class="stat-label">Rank downside — what the players you are missing project</div></div>';
+      html += '<div><div class="stat-figure">+' + e.upside.toFixed(1) + '</div>' +
+        '<div class="stat-label">Rank upside — what you hold that the field does not</div></div>';
+      html += '</div>';
+
+      function eoRows(list, kind) {
+        if (!list.length) return '<p class="muted">None.</p>';
+        var out = '<table class="eo-table"><thead><tr>' +
+          '<th>Player</th><th class="num">EO</th><th class="num">Owned</th><th class="num">Capt</th><th class="num">Swing</th>' +
+          '</tr></thead><tbody>';
+        list.forEach(function (r) {
+          var cls = r.delta >= 0 ? 'delta-rise' : 'delta-fall';
+          out += '<tr><td><span class="name">' + escapeHtml_(r.name) + '</span> ' +
+            '<span class="meta">' + escapeHtml_(r.team + ' · ' + r.position) + '</span></td>' +
+            '<td class="num"><strong>' + r.eo.toFixed(0) + '%</strong></td>' +
+            '<td class="num">' + r.owned.toFixed(0) + '%</td>' +
+            '<td class="num">' + r.captained.toFixed(0) + '%</td>' +
+            '<td class="num ' + cls + '">' + (r.delta >= 0 ? '+' : '') + r.delta.toFixed(1) + '</td></tr>';
+        });
+        return out + '</tbody></table>';
+      }
+
+      html += '<div class="two-col" style="margin-top:var(--space-4)">';
+      html += '<div><div class="section-kicker">Threats — the field has these, you do not</div>' +
+        eoRows(e.threats || []) + '</div>';
+      html += '<div><div class="section-kicker">Your edge — you have these, the field does not</div>' +
+        eoRows(e.edges || []) + '</div>';
+      html += '</div>';
+
+      html += '<p class="caveat">EO counts deployment, not just ownership: a benched player scores 0, a started player 1, a captain 2, a triple captain 3, averaged across ' +
+        e.managersCounted + ' rivals. <strong>Swing</strong> is what each player does to your rank — your own multiplier minus the field\'s EO, times his expected points. ' +
+        escapeHtml_(e.basis) + '</p>';
+      html += '</section>';
+      return html;
+    }
+
+    /* --- Ownership edge: rank is relative, points are not --- */
+    function sectionOwnership(data) {
+      var o = data.ownershipEdge;
+      if (!o) return '';
+      var html = '<section><div class="section-heading">Ownership edge</div>';
+      html += '<div class="ruling-body" style="margin-bottom:var(--space-4)">' + escapeHtml_(o.summary) + '</div>';
+      html += '<div class="two-col">';
+
+      html += '<div><div class="section-kicker">Template you are missing</div>';
+      if (!(o.missing || []).length) {
+        html += '<p class="muted">Nothing — you own every widely-held player.</p>';
+      } else {
+        o.missing.forEach(function (m) {
+          html += '<div class="list-row"><span class="name">' + escapeHtml_(m.name) +
+            ' <span class="meta">' + escapeHtml_(m.team + ' · ' + m.position + ' · £' + m.price.toFixed(1) + 'm') + '</span></span>' +
+            '<span class="delta-fall">' + m.ownership.toFixed(0) + '%</span></div>';
+        });
+      }
+      html += '</div>';
+
+      html += '<div><div class="section-kicker">Your differentials</div>';
+      if (!(o.differentials || []).length) {
+        html += '<p class="muted">None in your XI — every starter is owned by more than ' + 8 + '%. Safe, but nothing here can gain you rank.</p>';
+      } else {
+        o.differentials.forEach(function (d) {
+          html += '<div class="list-row"><span class="name">' + escapeHtml_(d.name) +
+            ' <span class="meta">' + escapeHtml_(d.team + ' · ' + d.position) + '</span></span>' +
+            '<span class="delta-rise">' + d.ownership.toFixed(1) + '% · ' + d.xpNext.toFixed(1) + ' xP</span></div>';
+        });
+      }
+      html += '</div></div>';
+      html += '<p class="caveat">Rank is a relative game. A player you do not own costs you rank every week he returns, whatever your own eleven scores — and a low-owned player is the only way to gain rank rather than hold it. Ownership is not a reason to buy on its own; it is the context for the points.</p>';
+      html += '</section>';
+      return html;
+    }
+
+    /* --- Calibration: is the model any good? ---
+     *
+     * The track record grades the CALLS — was the captain right, did the
+     * transfer pay. It never grades the arithmetic underneath them, which is
+     * the question a manager deciding how much to trust this page actually
+     * has. Predicted points against actual points answers it directly, and
+     * it is the one section here designed to be unflattering. */
+    function sectionCalibration(data) {
+      var c = data.calibration;
+      if (!c) return '';
+
+      var pctOff = c.predicted ? ((c.actual - c.predicted) / c.predicted) * 100 : 0;
+      var runsHot = pctOff < 0;
+      var html = '<section><div class="section-heading">Model calibration</div>';
+      html += '<p class="ruling-body" style="margin-bottom:var(--space-4)">Across ' + c.gwsGraded +
+        ' graded gameweek' + (c.gwsGraded === 1 ? '' : 's') + ' the model projected <strong>' + c.predicted.toFixed(0) +
+        '</strong> points (raw, before any correction) for every player it projected at 1 or more; they scored <strong>' + c.actual + '</strong>. ' +
+        (Math.abs(pctOff) < 3
+          ? 'That is within a few percent — the projections are broadly honest.'
+          : 'That is ' + Math.abs(pctOff).toFixed(0) + '% ' + (runsHot ? 'hot: it flatters players.' : 'cold: it under-rates them.')) +
+        '</p>';
+
+      html += '<div class="stat-band">';
+      html += '<div><div class="stat-figure">' + (pctOff >= 0 ? '+' : '') + pctOff.toFixed(0) + '%</div>' +
+        '<div class="stat-label">Actual points against projected, across ' + c.samples + ' player-gameweeks</div></div>';
+      if (c.applied) {
+        html += '<div><div class="stat-figure">' + Math.round(c.trust * 100) + '%</div>' +
+          '<div class="stat-label">How much of the measured bias is currently being corrected for &mdash; it grows with evidence</div></div>';
+      } else {
+        html += '<div><div class="stat-figure">&mdash;</div>' +
+          '<div class="stat-label">No correction applied yet &mdash; too few graded gameweeks to tell bias from noise</div></div>';
+      }
+      html += '</div>';
+
+      var positions = c.positions || {};
+      var keys = Object.keys(positions);
+      if (keys.length) {
+        html += '<div class="section-kicker" style="margin-top:var(--space-4)">By position</div>';
+        html += '<div class="tablewrap"><table class="eo-table"><thead><tr>' +
+          '<th>Position</th><th class="num">Projected</th><th class="num">Actual</th><th class="num">Off by</th><th class="num">Sample</th>' +
+          '</tr></thead><tbody>';
+        keys.sort().forEach(function (k) {
+          var p = positions[k];
+          var off = p.predicted ? ((p.actual - p.predicted) / p.predicted) * 100 : 0;
+          html += '<tr><td><span class="name">' + escapeHtml_(p.position) + '</span></td>' +
+            '<td class="num">' + p.predicted.toFixed(0) + '</td>' +
+            '<td class="num">' + p.actual + '</td>' +
+            '<td class="num ' + (off >= 0 ? 'delta-rise' : 'delta-fall') + '">' + (off >= 0 ? '+' : '') + off.toFixed(0) + '%</td>' +
+            '<td class="num">' + p.samples + '</td></tr>';
+        });
+        html += '</tbody></table></div>';
+      }
+
+      if ((c.series || []).length > 1) {
+        html += '<div class="section-kicker" style="margin-top:var(--space-4)">Gameweek by gameweek</div>';
+        html += '<div class="calib-series">';
+        var worst = Math.max.apply(null, c.series.map(function (s) { return Math.abs(s.diff); })) || 1;
+        c.series.forEach(function (s) {
+          var h = Math.max(2, Math.round((Math.abs(s.diff) / worst) * 34));
+          html += '<div class="calib-col" title="GW' + s.event + ': projected ' + s.predicted + ', actual ' + s.actual + '">' +
+            '<div class="calib-bar-wrap">' +
+              '<div class="calib-bar ' + (s.diff >= 0 ? 'over' : 'under') + '" style="height:' + h + 'px"></div>' +
+            '</div>' +
+            '<div class="calib-gw">' + s.event + '</div></div>';
+        });
+        html += '</div>';
+        html += '<p class="muted" style="font-size:12.5px">Bars above the line are gameweeks the players beat their projections; below, they fell short.</p>';
+      }
+
+      html += '<p class="caveat">Every player the model projected at 1 point or more is counted, zeros included: a projection already prices ' +
+        'the chance of not playing, so it is scored against every outcome, not only the ones where the player featured. The figures are the raw ' +
+        'projections, before this correction, so the correction is never learned on top of itself. The correction itself is one multiplier per position, shrunk toward no-change in proportion ' +
+        'to how little evidence supports it and clamped at \u00b125%: if a position is really further out than that, it is a bug to find rather ' +
+        'than a coefficient to paper over.</p>';
+      html += '</section>';
+      return html;
+    }
+
+    /* --- Track record: what the app's past calls actually did --- */
+    function sectionTrackRecord(data) {
+      var tr = data.trackRecord;
+      if (!tr) return '';
+      var html = '<section><div class="section-heading">Track record</div>';
+      html += '<p class="muted" style="margin-bottom:var(--space-4)">Every call this app made is checked against what actually happened, the first time it runs after a gameweek finishes. This is all of them — GW' +
+        tr.firstEvent + ' to GW' + tr.lastEvent + ', ' + tr.gwsGraded + ' graded.</p>';
+
+      // With one graded gameweek and no transfer calls yet, every tile below
+      // is skipped and the band renders as an empty grid taking real space.
+      var tiles = '';
+      // Efficiency leads. "Was he the literal top scorer" is a tail question
+      // on which even an optimal picker lands about a quarter of the time, so
+      // it makes a good model look broken and tells the manager nothing about
+      // the points that actually reached their score.
+      if (tr.captainEfficiency != null) {
+        tiles += '<div><div class="stat-figure">' + tr.captainEfficiency + '%</div>' +
+          '<div class="stat-label">Of a perfect armband\u2019s points, banked by the captain calls actually made</div></div>';
+      }
+      if (tr.captainAvgRank != null) {
+        tiles += '<div><div class="stat-figure">' + tr.captainAvgRank + '</div>' +
+          '<div class="stat-label">Where the captain finished in your eleven, on average' +
+          (tr.captainTop3Rate != null ? ' \u2014 top three in ' + tr.captainTop3Rate + '% of weeks' : '') + '</div></div>';
+      }
+      if (tr.captainHitRate != null) {
+        tiles += '<div><div class="stat-figure">' + tr.captainHitRate + '%</div>' +
+          '<div class="stat-label">Captain picks that were the outright top scorer (' + tr.captainHits + ' of ' + tr.captainCalls + ')' +
+          (tr.captainRandomBaseline != null ? ' \u2014 picking at random lands ~' + tr.captainRandomBaseline + '%' : '') + '</div></div>';
+      }
+      if (tr.transferWinRate != null) {
+        tiles += '<div><div class="stat-figure">' + tr.transferWinRate + '%</div>' +
+          '<div class="stat-label">Transfer calls that came out ahead the following gameweek</div></div>';
+      }
+      if (tr.transferCalls) {
+        tiles += '<div><div class="stat-figure">' + (tr.transferNetAfterHits >= 0 ? '+' : '') + tr.transferNetAfterHits + '</div>' +
+          '<div class="stat-label">Net points from transfer calls, after the cost of any hits</div></div>';
+      }
+      if (tr.lineupCalls) {
+        tiles += '<div><div class="stat-figure">' + (tr.lineupNet >= 0 ? '+' : '') + tr.lineupNet + '</div>' +
+          '<div class="stat-label">Points the recommended XI would have gained over the one you set</div></div>';
+      }
+      if (tiles) html += '<div class="stat-band">' + tiles + '</div>';
+
+      (tr.learnings || []).forEach(function (line) {
+        html += '<p class="ruling-body" style="margin-bottom:var(--space-2)">' + escapeHtml_(line) + '</p>';
+      });
+      html += '</section>';
+      return html;
+    }
+
+    /* Every chip carries what it is worth in points and the bar it has to
+     * clear, so "hold" is a comparison rather than an opinion. The little
+     * meter is the same fact as the number, read at a glance. */
+    function sectionChips(data) {
+      var html = '<section><div class="section-heading">Chip strategy</div>';
+      if (data.chipDecision) html += '<p class="ruling-body" style="margin-bottom:var(--space-4)"><strong>' + escapeHtml_(data.chipDecision.reason) + '</strong></p>';
+      html += '<div class="chip-board">';
+      (data.chipBoard || []).forEach(function (c) {
+        var tone = c.status === 'Used' ? 'pill-warm'
+          : (String(c.status).indexOf('Target') === 0 || c.status === 'Play now' ? 'pill-cool' : 'pill-warm');
+        html += '<div class="chip-card"><h4>' + escapeHtml_(c.label) + '</h4>' +
+          '<span class="pill ' + tone + '">' + escapeHtml_(c.status) + '</span>';
+        if (c.value != null && c.bar) {
+          var pctOfBar = Math.max(0, Math.min(1, c.value / c.bar));
+          var clears = c.value >= c.bar;
+          html += '<div class="chip-value">' +
+            '<span class="chip-num' + (clears ? ' clears' : '') + '">' +
+              (c.value >= 0 ? '+' : '') + c.value.toFixed(1) + '</span>' +
+            '<span class="chip-bar-label">pts &middot; needs ' + c.bar + '</span>' +
+            '<div class="chip-meter"><div class="chip-meter-fill' + (clears ? ' clears' : '') +
+              '" style="width:' + (pctOfBar * 100).toFixed(0) + '%"></div></div>' +
+            '</div>';
+        }
+        html += '<p>' + escapeHtml_(c.detail) + '</p></div>';
+      });
+      html += '</div>';
+      html += '<p class="caveat">Each chip is priced as the difference between the gameweek you play it in and the same gameweek without it. ' +
+        'Bench Boost is simply what your bench projects; Triple Captain is one more helping of the armband; Free Hit is the best legal eleven in the game ' +
+        'against your own; Wildcard is a squad rebuilt at your budget, measured over the whole horizon because it changes structure rather than one week. ' +
+        'The bars are thresholds for spending a one-use chip, not laws — a chip you never play is worth nothing at all.</p>';
+      html += '</section>';
+      return html;
+    }
+
+    function sectionFixtures(data) {
+      var fg = data.fixtureGrid;
+      if (!fg || !fg.rows || !fg.rows.length) return '';
+      var html = '<section><div class="section-heading">Next ' + fg.eventIds.length + ' gameweeks</div><div class="fixture-scroll"><div class="fixture-grid">';
+      html += '<div class="fixture-cell head club"></div>';
+      fg.eventIds.forEach(function (evId) { html += '<div class="fixture-cell head">GW' + evId + '</div>'; });
+      fg.rows.forEach(function (row) {
+        html += '<div class="fixture-cell club">' + escapeHtml_(row.club) + '</div>';
+        row.cells.forEach(function (cell) {
+          html += '<div class="fixture-cell ' + fdrClass_(cell.difficulty) + '">' + escapeHtml_(cell.label) + '</div>';
+        });
+      });
+      html += '</div></div></section>';
+      return html;
+    }
+
+    /* Price watch leads with what has not happened yet. A change already
+     * banked is history; a change about to land is the only thing here you
+     * can still act on, and it has a deadline of tonight. */
+    function priceRows_(list) {
+      var out = '';
+      list.forEach(function (p) {
+        out += '<div class="list-row"><span class="name">' + escapeHtml_(p.name) +
+          ' <span class="meta">' + escapeHtml_(p.team + ' \u00b7 \u00a3' + p.price.toFixed(1) + 'm') +
+          (p.alreadyMoved ? ' \u00b7 already moved this GW' : '') + '</span></span>' +
+          '<span class="' + (p.direction === 'rise' ? 'delta-rise' : 'delta-fall') + '" title="' +
+          p.net.toLocaleString() + ' net transfers, ' + Math.round(Math.abs(p.pressure) * 100) + '% of his owner base">' +
+          escapeHtml_(p.label) + '</span></div>';
+      });
+      return out;
+    }
+
+    function sectionPriceAndRisk(data) {
+      var html = '<section><div class="two-col">';
+      html += '<div><div class="section-heading">Price watch</div>';
+      var pw = data.priceWatch || {};
+      var targets = pw.targets || [], mySquad = pw.squad || [], movers = pw.movers || [], settled = pw.settled || [];
+
+      if (pw.urgent) {
+        html += '<div class="urgent-price"><strong>' + escapeHtml_(pw.urgent.name) + '</strong> is a recommended buy and looks like rising before the next update. ' +
+          'Buying tonight saves 0.1 \u2014 and you only ever bank half of a rise you missed.</div>';
+      }
+
+      if (targets.length) {
+        html += '<div class="section-kicker">Players you have been told to buy</div>' + priceRows_(targets);
+      }
+      if (mySquad.length) {
+        html += '<div class="section-kicker" style="margin-top:var(--space-3)">Your squad</div>' + priceRows_(mySquad);
+      }
+      if (movers.length) {
+        html += '<div class="section-kicker" style="margin-top:var(--space-3)">Elsewhere in the market</div>' + priceRows_(movers);
+      }
+      if (!targets.length && !mySquad.length && !movers.length) {
+        html += '<p class="muted">Nothing under real price pressure right now.</p>';
+      }
+
+      if (settled.length) {
+        html += '<div class="section-kicker" style="margin-top:var(--space-3)">Already settled this gameweek</div>';
+        settled.forEach(function (p) {
+          html += '<div class="list-row"><span class="name">' + escapeHtml_(p.name) + ' <span class="meta">' + escapeHtml_(p.team) + '</span></span>' +
+            '<span class="' + (p.direction === 'rise' ? 'delta-rise' : 'delta-fall') + '">' +
+            (p.direction === 'rise' ? '+' : '') + p.delta.toFixed(1) + 'm</span></div>';
+        });
+      }
+
+      html += '<p class="caveat">FPL does not publish its price-change algorithm, so nothing here is a promise. ' +
+        'What is measured is pressure: net transfers this gameweek set against the number of people who already own the player, ' +
+        'because 60,000 net transfers into a 2%-owned punt and into a 45%-owned premium are not the same event. ' +
+        'Counts run for the whole gameweek while prices change nightly, so anyone marked <em>already moved</em> has spent part of the momentum still showing in his numbers.</p>';
+      html += '</div>';
+
+      html += '<div><div class="section-heading">Injury &amp; rotation risk</div>';
+      var rw = data.riskWatch || [];
+      if (!rw.length) {
+        html += '<p class="muted">No flagged players in your squad.</p>';
+      } else {
+        // `news` is free text written by a club, relayed by the API — the
+        // single least trustworthy string on the page.
+        rw.forEach(function (p) {
+          html += h('div', { 'class': 'list-row' }, [
+            raw(h('span', { 'class': 'name' }, [p.name, ' ', raw(h('span', { 'class': 'meta' }, p.team))])),
+            raw(h('span', { 'class': 'pill pill-hot', title: p.news || '' }, p.pill))
+          ]);
+        });
+      }
+      html += '</div></div></section>';
+      return html;
+    }
+
+    function sectionMiniLeague(data) {
+      var leagues = data.availableLeagues || [];
+      if (!leagues.length) return '';
+      var ml = data.miniLeague;
+
+      var html = '<section><div class="section-heading" style="display:flex;align-items:baseline;gap:var(--space-3);flex-wrap:wrap">' +
+        '<span>' + escapeHtml_(ml && ml.leagueName ? ml.leagueName : 'Mini-league') + '</span>';
+      if (leagues.length > 1) {
+        html += '<select id="leagueSelect" style="font-size:13px;padding:4px 6px;border:1px solid var(--color-neutral-300);background:var(--color-bg);color:var(--color-text);border-radius:var(--radius-md);font-family:var(--font-body)">';
+        leagues.forEach(function (l) {
+          html += '<option value="' + l.id + '"' + (String(l.id) === String(data.selectedLeagueId) ? ' selected' : '') + '>' + escapeHtml_(l.name) + '</option>';
+        });
+        html += '</select>';
+      }
+      html += '</div>';
+
+      if (!ml || !ml.rows || !ml.rows.length) {
+        html += '<p class="muted">No standings yet' + (data.preseason ? ' — points start counting once GW1 kicks off.' : ' for this league.') + '</p>';
+      } else {
+        html += '<table class="table"><thead><tr><th>Rank</th><th>Manager</th><th>Team</th><th>Points</th></tr></thead><tbody>';
+        ml.rows.forEach(function (r) {
+          html += '<tr class="' + (r.isYou ? 'you' : '') + '"><td>' + r.rank + '</td><td>' + escapeHtml_(r.name) + '</td><td>' + escapeHtml_(r.entryName) + '</td><td>' + r.total + '</td></tr>';
+        });
+        html += '</tbody></table>';
+      }
+      html += '</section>';
+      return html;
+    }
+
+    function sectionCompare(data) {
+      var html = '<div>';
+      // Backtest figures are the fallback, not the headline. Once this
+      // account has graded gameweeks of its own, those are shown instead —
+      // a claim about THIS team beats a claim about a simulation, and it
+      // stops the page advertising numbers that predate several changes to
+      // the scoring formula.
+      var tr = data.trackRecord;
+      html += '<div class="stat-band">';
+      if (tr && tr.transferCalls) {
+        html += '<div><div class="stat-figure">' + (tr.transferNetAfterHits >= 0 ? '+' : '') + tr.transferNetAfterHits +
+          '</div><div class="stat-label">Net points from this app\'s transfer calls on your team, across ' + tr.transferCalls + ' calls</div></div>';
+      } else {
+        html += '<div><div class="stat-figure">+14.1%</div><div class="stat-label">Backtested vs. a static hold-GW1-squad baseline, full 2025-26 season</div></div>';
+      }
+      if (tr && tr.transferWinRate != null) {
+        html += '<div><div class="stat-figure">' + tr.transferWinRate + '%</div><div class="stat-label">Of those calls came out ahead the following gameweek</div></div>';
+      } else {
+        html += '<div><div class="stat-figure">60%</div><div class="stat-label">Of suggested transfers were net-positive over the following 3 gameweeks</div></div>';
+      }
+      html += '<div><div class="stat-figure">30s</div><div class="stat-label">To read this page, vs. an evening of forums and spreadsheets</div></div>';
+      if (tr && tr.gwsGraded) {
+        html += '<div><div class="stat-figure">' + tr.gwsGraded + '</div><div class="stat-label">Gameweeks graded so far — see the Track record section above for all of them</div></div>';
+      } else {
+        html += '<div><div class="stat-figure">Weekly</div><div class="stat-label">Self-grading — every past call is checked against what actually happened</div></div>';
+      }
+      html += '</div>';
+      html += '<table class="table"><thead><tr><th></th><th>Official site</th><th>YouTube + Reddit</th><th>Your spreadsheet</th><th>Command Centre</th></tr></thead><tbody>' +
+        compareRow_('Who to transfer', 'Raw stats only', 'Opinions, no your-squad context', 'Manual, time-consuming', 'Ranked, grounded in your squad') +
+        compareRow_('When to chip', 'No guidance', 'Generic advice', 'You track it yourself', 'Tied to your clubs\' doubles/blanks') +
+        compareRow_('Captain', 'Ownership %  only', 'Popularity contest', 'Gut feel', 'Expected points for this week\'s actual fixture, with the margin stated') +
+        compareRow_('Who to start', 'Nothing', 'Nothing', 'Manual', 'Best legal XI by expected points, plus bench order') +
+        compareRow_('Worth a hit?', 'No guidance', 'Opinions', 'Gut feel', 'Gain in points, compared against the −4') +
+        compareRow_('Price moves', 'After the fact', 'Rumour threads', 'Not tracked', 'Tracked in your squad') +
+        compareRow_('Injury risk', 'Status flag only', 'Scattered', 'Not tracked', 'Surfaced with the news') +
+        compareRow_('Was it right?', 'No', 'No', 'Rarely revisited', 'Graded every week') +
+        '</tbody></table>';
+      html += '<p class="caveat">Honest caveat: captaincy is irreducibly high-variance, and being the outright top scorer is a tail event \u2014 ' +
+        'even a model that picks perfectly on expectation only lands it about a quarter of the time, and picking at random from your eleven lands it around ' +
+        (tr && tr.captainRandomBaseline != null ? tr.captainRandomBaseline + '%' : '9%') + '. That is why the first figure above is efficiency ' +
+        '(the share of a perfect armband\u2019s points actually banked) rather than a hit rate' +
+        ((tr && tr.captainEfficiency != null) ? ', and on your own team it is running at ' + tr.captainEfficiency + '%' : '') + '. ' +
+        'The pick itself is chosen by simulating each candidate\u2019s scoring distribution against your league\u2019s real captains, so the percentage beside it ' +
+        'is a simulated probability, not a margin of averages. Backtest figures elsewhere on this page predate several changes to the model \u2014 treat them as directional.</p>';
+      html += '</div>';
+      return html;
+    }
+
+    function compareRow_(job, a, b, c, d) {
+      return '<tr><td>' + job + '</td><td>' + a + '</td><td>' + b + '</td><td>' + c + '</td><td>' + d + '</td></tr>';
+    }
+
+    /* ===================== AI ASSISTANT ===================== */
+
+    function sectionAi(data) {
+      if (!data.hasAiKey) {
+        return '<section class="ai-setup"><div class="section-heading">AI Assistant</div>' +
+          '<p class="ruling-body" style="margin-bottom:var(--space-2)">Ask free-form questions about your squad and these suggestions — ' +
+          '"why not captain Haaland instead?", "is my defense too thin?" — grounded in the real data above, not guesses. ' +
+          'Also turns on a written weekly verdict instead of the rule-based one.</p>' +
+          '<p class="muted" style="margin-bottom:var(--space-2)">Needs your own Anthropic API key (billed to you directly by Anthropic). ' +
+          '<a href="https://console.anthropic.com/settings/keys" target="_blank">Get an API key →</a></p>' +
+          '<input type="password" id="aiKeyInput" placeholder="sk-ant-...">' +
+          '<button onclick="submitAiKey()">Save &amp; enable</button>' +
+          '<p class="error-text" id="aiKeyError"></p>' +
+          '</section>';
+      }
+      return '<section><div class="section-heading">AI Assistant</div>' +
+        '<p class="muted" style="font-size:13px;margin-bottom:var(--space-3)">Grounded in the squad above, and able to look things up: ' +
+        'match-by-match history for any player in the game, your season gameweek by gameweek, your rivals&rsquo; squads, ' +
+        'and the player pool by any criteria. It remembers the conversation between visits.</p>' +
+        '<div class="chat-log" id="chatLog"></div>' +
+        '<div class="chat-input-row">' +
+        '<input type="text" id="chatInput" placeholder="Ask about your squad, or anyone in the game…" onkeydown="if(event.key===\'Enter\')sendChat();">' +
+        '<button id="chatSendBtn" onclick="sendChat()">Ask</button>' +
+        '</div>' +
+        '<div class="error-text" id="chatError"></div>' +
+        '<p class="muted" style="font-size:12px;margin-top:var(--space-2)">' +
+        '<a href="#" onclick="clearChatClick(); return false;">Clear conversation</a> &middot; ' +
+        '<a href="#" onclick="clearAiKeyClick(); return false;">Remove API key</a></p>' +
+        '</section>';
+    }
+
+    var CHAT_PROMPTS = [
+      'Has Semenyo started every game this season?',
+      'Compare my two most expensive midfielders',
+      'How has my season gone against the average?',
+      'Who in my league owns players I do not?'
+    ];
+
+    function renderChatLog() {
+      var log = document.getElementById('chatLog');
+      if (!log) return;
+      if (!STATE.chatHistory.length) {
+        log.innerHTML = '<p class="muted">Ask anything about your squad, any player in the game, or how your season has gone. For example:</p>' +
+          '<div class="chat-prompts">' + CHAT_PROMPTS.map(function (p) {
+            return '<button class="chat-prompt" onclick="askPrompt_(this.textContent)">' + escapeHtml_(p) + '</button>';
+          }).join('') + '</div>';
+        return;
+      }
+      log.innerHTML = STATE.chatHistory.map(function (m) {
+        // What the assistant looked up, shown above its answer. An assistant
+        // that quietly fetches a match log and states the result reads as one
+        // that made the number up; naming the lookup is what makes it
+        // checkable.
+        var tools = (m.toolsUsed || []).length
+          ? '<div class="chat-tools">' + m.toolsUsed.map(function (t) {
+              return '<span class="chat-tool">' + escapeHtml_(t) + '</span>';
+            }).join('') + '</div>'
+          : '';
+        return '<div class="chat-msg ' + m.role + '"><span class="role">' + (m.role === 'user' ? 'You' : 'Command Centre') + '</span>' +
+          tools + escapeHtml_(m.content).replace(/\n/g, '<br>') + '</div>';
+      }).join('');
+    }
+
+    function askPrompt_(text) {
+      var input = document.getElementById('chatInput');
+      if (!input) return;
+      input.value = text;
+      sendChat();
+    }
+
+    /* The transcript lives on the server, so it survives the reload that a
+     * Refresh, a team-id change or a deploy causes. Fetched once per load,
+     * after the dashboard itself so it never delays the page. */
+    function loadChatHistory_() {
+      if (!(STATE.data && STATE.data.hasAiKey)) return;
+      google.script.run
+        .withSuccessHandler(function (history) {
+          if (!history || !history.length) return;
+          STATE.chatHistory = history;
+          renderChatLog();
+        })
+        .withFailureHandler(function () { /* an empty transcript is not an error worth showing */ })
+        .getChatHistory();
+    }
+
+    function clearChatClick() {
+      STATE.chatHistory = [];
+      renderChatLog();
+      google.script.run.clearChatHistory();
+    }
+
+    function submitAiKey() {
+      var val = document.getElementById('aiKeyInput').value;
+      google.script.run.withSuccessHandler(function () { loadDashboard(); })
+        .withFailureHandler(function (err) { document.getElementById('aiKeyError').textContent = err.message || err; })
+        .saveAiKey(val);
+    }
+
+    function clearAiKeyClick() {
+      STATE.chatHistory = [];
+      google.script.run.withSuccessHandler(function () { loadDashboard(); }).clearAiKey();
+    }
+
+    function sendChat() {
+      var input = document.getElementById('chatInput');
+      var question = input.value.trim();
+      if (!question) return;
+      input.value = '';
+      document.getElementById('chatError').textContent = '';
+      document.getElementById('chatSendBtn').disabled = true;
+
+      STATE.chatHistory.push({ role: 'user', content: question });
+      renderChatLog();
+      var log = document.getElementById('chatLog');
+      // A tool-using turn can take several round trips, so the wait is long
+      // enough to need saying something during. The label advances rather
+      // than sitting on a static ellipsis.
+      log.innerHTML += '<div class="chat-msg assistant" id="chatThinking"><span class="role">Command Centre</span>' +
+        '<span id="chatThinkingText">Reading your squad…</span></div>';
+      log.scrollTop = log.scrollHeight;
+      startThinkingTicker_();
+
+      google.script.run
+        .withSuccessHandler(function (res) {
+          stopThinkingTicker_();
+          // The server returns {answer, toolsUsed}; a bare string means an
+          // older deployment is still serving, so accept both.
+          var answer = (res && res.answer) ? res.answer : String(res || '');
+          STATE.chatHistory.push({ role: 'assistant', content: answer, toolsUsed: (res && res.toolsUsed) || [] });
+          renderChatLog();
+          document.getElementById('chatLog').scrollTop = document.getElementById('chatLog').scrollHeight;
+          document.getElementById('chatSendBtn').disabled = false;
+          // A transfer was recorded: the squad on the page is out of date.
+          if (res && res.squadChanged) loadDashboard();
+        })
+        .withFailureHandler(function (err) {
+          stopThinkingTicker_();
+          document.getElementById('chatError').textContent = err.message || err;
+          renderChatLog();
+          document.getElementById('chatSendBtn').disabled = false;
+        })
+        .askAI(question);
+    }
+
+    var chatTicker = null;
+    var CHAT_WAIT_STAGES = ['Reading your squad…', 'Looking things up…', 'Checking the numbers…', 'Writing…'];
+
+    function startThinkingTicker_() {
+      var i = 0;
+      stopThinkingTicker_();
+      chatTicker = setInterval(function () {
+        i++;
+        var el = document.getElementById('chatThinkingText');
+        if (!el) { stopThinkingTicker_(); return; }
+        el.textContent = CHAT_WAIT_STAGES[Math.min(i, CHAT_WAIT_STAGES.length - 1)];
+      }, 3500);
+    }
+
+    function stopThinkingTicker_() {
+      if (chatTicker) { clearInterval(chatTicker); chatTicker = null; }
+    }
+
+
+    /* ===================== COMMAND PALETTE =====================
+     *
+     * The dashboard answers a lot of questions, and the cost of each answer
+     * is finding the section that holds it — scroll, open the right
+     * <details>, read across a table. That is the right shape for reading
+     * the week's verdict and the wrong shape for "what is Semenyo projecting
+     * against Stach", which is a question with a two-line answer that a
+     * manager wants without leaving where they are.
+     *
+     * So: Cmd+K (Ctrl+K elsewhere) opens a terminal over the page. Commands
+     * that HAVE a short answer render it in place rather than navigating —
+     * that is the whole point, and a palette that only ever scrolled you
+     * somewhere would be a table of contents with extra steps. Commands that
+     * do not, jump to the section and open it.
+     *
+     * Everything here reads STATE.data, which is already loaded. No command
+     * costs a round trip except /ask, which is explicitly a question for the
+     * assistant.
+     */
+    var PALETTE = { open: false, index: [], filtered: [], cursor: 0 };
+
+    var PALETTE_COMMANDS = [
+      { cmd: '/cap',     args: '',            label: 'The captain call, and the margin behind it', run: paletteCaptain_ },
+      { cmd: '/compare', args: '<a> <b>',     label: 'Compare players side by side on the Ratings page', run: paletteCompare_ },
+      { cmd: '/player',  args: '<name>',      label: 'One player in your squad, in full', run: palettePlayer_ },
+      { cmd: '/eo',      args: '',            label: 'Effective ownership against your league', run: paletteEo_ },
+      { cmd: '/plan',    args: '',            label: 'The multi-gameweek transfer plan', run: palettePlan_ },
+      { cmd: '/price',   args: '',            label: 'What is about to rise or fall', run: palettePrice_ },
+      { cmd: '/xi',      args: '',            label: 'The best legal starting eleven', run: paletteXi_ },
+      { cmd: '/live',    args: '',            label: 'How this gameweek is going, right now', run: paletteLive_ },
+      { cmd: '/do',      args: '',            label: 'Every decision for this gameweek', run: function () { return paletteJump_('Do now'); } },
+      { cmd: '/ask',     args: '<question>',  label: 'Ask the assistant, grounded in your squad', run: paletteAsk_ },
+      { cmd: '/refresh', args: '',            label: 'Reload live data from the FPL API', run: function () { closePalette(); loadDashboard(true); } }
+    ];
+
+    function isMac_() { return /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || ''); }
+
+    function openPalette() {
+      if (PALETTE.open) return;
+      PALETTE.open = true;
+      buildPaletteIndex_();
+      var back = document.getElementById('paletteBackdrop');
+      back.hidden = false;
+      var input = document.getElementById('paletteInput');
+      input.value = '';
+      document.getElementById('paletteAnswer').hidden = true;
+      filterPalette_('');
+      input.focus();
+    }
+
+    function closePalette() {
+      PALETTE.open = false;
+      document.getElementById('paletteBackdrop').hidden = true;
+    }
+
+    /* Sections come from the rendered DOM rather than a hand-kept list, so a
+     * section added to the page is reachable from the palette without anyone
+     * remembering to register it. */
+    function buildPaletteIndex_() {
+      var index = [];
+
+      PALETTE_COMMANDS.forEach(function (c) {
+        index.push({ kind: 'command', cmd: c.cmd, args: c.args, label: c.label, hint: 'command',
+          key: c.cmd + ' ' + c.label, run: c.run });
+      });
+
+      var seen = {};
+      Array.prototype.forEach.call(document.querySelectorAll('#app .section-heading, #app .evi-title'), function (el) {
+        // .evi-title carries its blurb in a nested span; the heading is the
+        // first text node, not the whole textContent.
+        var blurb = el.querySelector('.evi-blurb');
+        var title = (blurb ? el.childNodes[0].textContent : el.textContent).trim();
+        if (!title || seen[title.toLowerCase()]) return;
+        seen[title.toLowerCase()] = true;
+        index.push({ kind: 'section', label: title, hint: 'go to section', key: title, node: el });
+      });
+
+      var squad = (STATE.data && STATE.data.squad && STATE.data.squad.players) || [];
+      squad.forEach(function (p) {
+        index.push({
+          kind: 'player', label: p.name,
+          hint: p.position + ' · ' + p.team + ' · ' + (p.xp ? p.xp.next.toFixed(1) + ' xP' : '£' + p.price.toFixed(1) + 'm'),
+          key: p.name + ' ' + p.team + ' ' + p.position, player: p
+        });
+      });
+
+      PALETTE.index = index;
+    }
+
+    /* Subsequence matching, not substring: "smny" finds Semenyo, which is the
+     * behaviour anyone who has used a palette expects. Ranked so an earlier
+     * and tighter match wins. */
+    function paletteScore_(haystack, needle) {
+      if (!needle) return 1;
+      var h = haystack.toLowerCase(), n = needle.toLowerCase();
+      var exact = h.indexOf(n);
+      if (exact === 0) return 1000;
+      if (exact > 0) return 500 - exact;
+      var hi = 0, first = -1, gaps = 0, last = -1;
+      for (var i = 0; i < n.length; i++) {
+        var c = n.charAt(i);
+        if (c === ' ') continue;
+        var at = h.indexOf(c, hi);
+        if (at === -1) return 0;
+        if (first === -1) first = at;
+        if (last !== -1) gaps += at - last - 1;
+        last = at;
+        hi = at + 1;
+      }
+      return Math.max(1, 200 - first - gaps);
+    }
+
+    function filterPalette_(query) {
+      var q = query.trim();
+      var answer = document.getElementById('paletteAnswer');
+
+      // A complete command with its arguments answers as you type — no Enter
+      // needed for the read-only ones.
+      var live = paletteLiveAnswer_(q);
+      if (live) { answer.innerHTML = live; answer.hidden = false; }
+      else { answer.hidden = true; }
+
+      var pool = PALETTE.index;
+      if (q.charAt(0) === '/') {
+        var head = q.split(/\s+/)[0];
+        pool = pool.filter(function (r) { return r.kind === 'command'; });
+        PALETTE.filtered = pool.map(function (r) { return { r: r, s: paletteScore_(r.cmd, head) }; })
+          .filter(function (x) { return x.s > 0; })
+          .sort(function (a, b) { return b.s - a.s; })
+          .map(function (x) { return x.r; });
+      } else {
+        PALETTE.filtered = pool.map(function (r) { return { r: r, s: paletteScore_(r.key, q) }; })
+          .filter(function (x) { return x.s > 0; })
+          .sort(function (a, b) { return b.s - a.s; })
+          .slice(0, 12)
+          .map(function (x) { return x.r; });
+      }
+
+      PALETTE.cursor = 0;
+      renderPaletteResults_();
+    }
+
+    function renderPaletteResults_() {
+      var box = document.getElementById('paletteResults');
+      if (!PALETTE.filtered.length) {
+        box.innerHTML = '<div class="palette-empty">Nothing matches. Type <code>/</code> to see every command.</div>';
+        return;
+      }
+      box.innerHTML = PALETTE.filtered.map(function (r, i) {
+        var left = r.kind === 'command'
+          ? '<span class="pr-cmd">' + escapeHtml_(r.cmd + (r.args ? ' ' + r.args : '')) + '</span>'
+          : '';
+        return '<div class="palette-row" role="option" aria-selected="' + (i === PALETTE.cursor) + '" ' +
+          'onmousemove="paletteCursor_(' + i + ')" onclick="paletteRun_(' + i + ')">' +
+          left +
+          '<span class="pr-label">' + escapeHtml_(r.label) + '</span>' +
+          '<span class="pr-hint">' + escapeHtml_(r.hint) + '</span></div>';
+      }).join('');
+      var sel = box.children[PALETTE.cursor];
+      if (sel && sel.scrollIntoView) sel.scrollIntoView({ block: 'nearest' });
+    }
+
+    function paletteCursor_(i) {
+      if (i === PALETTE.cursor) return;
+      PALETTE.cursor = i;
+      renderPaletteResults_();
+    }
+
+    function paletteRun_(i) {
+      var row = PALETTE.filtered[i];
+      if (!row) return;
+      var input = document.getElementById('paletteInput');
+      if (row.kind === 'command') {
+        // A command needing arguments completes the input instead of running,
+        // so Enter is never a dead keystroke.
+        if (row.args && input.value.trim().split(/\s+/).length < 2) {
+          input.value = row.cmd + ' ';
+          filterPalette_(input.value);
+          input.focus();
+          return;
+        }
+        var out = row.run(paletteArgs_(input.value));
+        if (out) { showPaletteAnswer_(out); }
+        return;
+      }
+      if (row.kind === 'section') { paletteGoTo_(row.node); return; }
+      if (row.kind === 'player') { showPaletteAnswer_(palettePlayerCard_(row.player)); return; }
+    }
+
+    function paletteArgs_(value) {
+      var parts = value.trim().split(/\s+/);
+      parts.shift();
+      return parts.join(' ').trim();
+    }
+
+    /* Answers that can be computed from loaded data render as you type. /ask
+     * and /compare are excluded: one costs a round trip and the other
+     * navigates, so neither should fire on a keystroke. */
+    function paletteLiveAnswer_(q) {
+      if (q.charAt(0) !== '/') return null;
+      var parts = q.trim().split(/\s+/);
+      var head = parts[0];
+      var rest = parts.slice(1).join(' ');
+      var cmd = PALETTE_COMMANDS.filter(function (c) { return c.cmd === head; })[0];
+      if (!cmd) return null;
+      if (head === '/ask' || head === '/compare' || head === '/refresh' || head === '/do') return null;
+      if (cmd.args && !rest) return null;
+      try { return cmd.run(rest, true) || null; } catch (e) { return null; }
+    }
+
+    function showPaletteAnswer_(html) {
+      var a = document.getElementById('paletteAnswer');
+      a.innerHTML = html;
+      a.hidden = false;
+    }
+
+    function paletteGoTo_(node) {
+      closePalette();
+      // The target may sit inside a collapsed evidence row; opening its
+      // ancestor first means the scroll lands on content, not on a closed bar.
+      var det = node.closest ? node.closest('details') : null;
+      if (det) det.open = true;
+      var target = det || node;
+      if (target.scrollIntoView) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      target.classList.add('palette-landed');
+      setTimeout(function () { target.classList.remove('palette-landed'); }, 1500);
+    }
+
+    function paletteJump_(title) {
+      var row = PALETTE.index.filter(function (r) {
+        return r.kind === 'section' && r.label.toLowerCase().indexOf(title.toLowerCase()) === 0;
+      })[0];
+      if (row) paletteGoTo_(row.node);
+      else showPaletteAnswer_('<div class="pa-head">Not on this page</div><div>' + escapeHtml_(title) + ' has not rendered — the data behind it is missing this week.</div>');
+      return null;
+    }
+
+    function paletteNoData_(what) {
+      return '<div class="pa-head">' + escapeHtml_(what) + '</div>' +
+        '<div class="pa-note">Not available this week — the data behind it has not loaded.</div>';
+    }
+
+    /* --- the answers --- */
+
+    function paletteCaptain_() {
+      var caps = (STATE.data && STATE.data.captainSuggestions) || [];
+      if (!caps.length) return paletteNoData_('Captain');
+      var html = '<div class="pa-head">Captain</div>';
+      caps.slice(0, 4).forEach(function (c, i) {
+        html += '<div class="pa-row"><span>' + (i === 0 ? '<strong>' : '') + escapeHtml_(c.name) + (i === 0 ? '</strong>' : '') +
+          ' <span class="pr-hint">' + escapeHtml_(c.team + ' · ' + c.nextFixture) + '</span></span>' +
+          '<span class="num">' + (c.topShare != null ? Math.round(c.topShare) + '% · ' : '') +
+          (c.xp != null ? c.xp.toFixed(1) + ' xP' : 'form ' + c.form) + '</span></div>';
+      });
+      if (caps[0] && caps[0].topShare != null) {
+        html += '<div class="pa-note">Percentages are the simulated chance of topping your eleven. ' +
+          escapeHtml_(String(caps[0].confidence || 'Low')) + ' confidence' +
+          (caps[0].beatFieldShare != null
+            ? '; beats your league\u2019s captain ' + Math.round(caps[0].beatFieldShare) + '% of the time' : '') + '.' +
+          (caps[0].disagreesWithMean ? ' ' + escapeHtml_(caps[0].disagreesWithMean.note) : '') + '</div>';
+      } else if (caps[0] && caps[0].margin != null) {
+        html += '<div class="pa-note">' + caps[0].margin.toFixed(1) + ' points clear of the next option — ' +
+          escapeHtml_(String(caps[0].confidence).toLowerCase()) + ' confidence.</div>';
+      }
+      return html;
+    }
+
+    function palettePlayer_(name) {
+      var p = paletteFindPlayer_(name);
+      if (!p) return '<div class="pa-head">Player</div><div class="pa-note">No one in your squad matches &ldquo;' +
+        escapeHtml_(name) + '&rdquo;. Use <code>/compare</code> to look up anyone in the game.</div>';
+      return palettePlayerCard_(p);
+    }
+
+    function paletteFindPlayer_(name) {
+      var squad = (STATE.data && STATE.data.squad && STATE.data.squad.players) || [];
+      if (!name) return null;
+      var scored = squad.map(function (p) { return { p: p, s: paletteScore_(p.name, name) }; })
+        .filter(function (x) { return x.s > 0; })
+        .sort(function (a, b) { return b.s - a.s; });
+      return scored.length ? scored[0].p : null;
+    }
+
+    function palettePlayerCard_(p) {
+      var html = '<div class="pa-head">' + escapeHtml_(p.name) + ' — ' + escapeHtml_(p.team + ' · ' + p.position) + '</div>';
+      html += '<div class="pa-row"><span>Price</span><span class="num">£' + p.price.toFixed(1) + 'm</span></div>';
+      if (p.xp) {
+        html += '<div class="pa-row"><span>Expected points, this gameweek</span><span class="num">' + p.xp.next.toFixed(1) + '</span></div>';
+        html += '<div class="pa-row"><span>Expected points, full horizon</span><span class="num">' + p.xp.horizon.toFixed(1) + '</span></div>';
+      }
+      html += '<div class="pa-row"><span>Form</span><span class="num">' + escapeHtml_(String(p.form)) + '</span></div>';
+      if (p.selectedBy != null) html += '<div class="pa-row"><span>Owned by</span><span class="num">' + p.selectedBy.toFixed(1) + '%</span></div>';
+      html += '<div class="pa-row"><span>In the eleven</span><span class="num">' +
+        (p.isStarting ? (p.isCaptain ? 'Yes — captain' : 'Yes') : 'Benched') + '</span></div>';
+      if (p.status && p.status !== 'a' && p.news) html += '<div class="pa-note">' + escapeHtml_(p.news) + '</div>';
+      else if (p.reason) html += '<div class="pa-note">' + escapeHtml_(p.reason) + '</div>';
+      return html;
+    }
+
+    function paletteEo_() {
+      var e = STATE.data && STATE.data.leagueEo;
+      if (!e) return paletteNoData_('Effective ownership');
+      if (e.unavailable) return '<div class="pa-head">Effective ownership</div><div class="pa-note">' + escapeHtml_(e.unavailable) + '</div>';
+      var html = '<div class="pa-head">Effective ownership — ' + escapeHtml_(e.leagueName) + '</div>';
+      html += '<div class="pa-row"><span>Net exposure against the field</span><span class="num">' +
+        (e.net >= 0 ? '+' : '') + e.net.toFixed(1) + ' pts</span></div>';
+      (e.threats || []).slice(0, 4).forEach(function (r) {
+        html += '<div class="pa-row"><span>' + escapeHtml_(r.name) + ' <span class="pr-hint">you do not own</span></span>' +
+          '<span class="num">' + r.eo.toFixed(0) + '% EO · ' + r.delta.toFixed(1) + '</span></div>';
+      });
+      html += '<div class="pa-note">' + escapeHtml_(e.summary) + '</div>';
+      return html;
+    }
+
+    function palettePlan_() {
+      var r = STATE.data && STATE.data.roadmap;
+      if (!r || !(r.weeks || []).length) return paletteNoData_('The plan');
+      var html = '<div class="pa-head">The next ' + r.horizonGws + ' gameweeks</div>';
+      r.weeks.forEach(function (w) {
+        html += '<div class="pa-row"><span>GW' + w.event + ' <span class="pr-hint">' +
+          (w.moves.length ? escapeHtml_(w.moves.map(function (m) { return m.inName + ' for ' + m.outName; }).join(', ')) : 'roll') +
+          '</span></span><span class="num">' + (w.hits ? '−' + (w.hits * 4) : (w.moves.length ? 'free' : '+1 FT')) + '</span></div>';
+      });
+      if (r.divergence) html += '<div class="pa-note">' + escapeHtml_(r.divergence.summary) + '</div>';
+      return html;
+    }
+
+    function palettePrice_() {
+      var p = STATE.data && STATE.data.priceWatch;
+      if (!p) return paletteNoData_('Price watch');
+      var rows = (p.targets || []).concat(p.squad || []).concat(p.movers || []);
+      if (!rows.length) return '<div class="pa-head">Price watch</div><div class="pa-note">Nothing under real price pressure right now.</div>';
+      var html = '<div class="pa-head">Price pressure</div>';
+      rows.slice(0, 6).forEach(function (r) {
+        html += '<div class="pa-row"><span>' + escapeHtml_(r.name) + ' <span class="pr-hint">' + escapeHtml_(r.why) + '</span></span>' +
+          '<span class="num">' + escapeHtml_(r.label) + '</span></div>';
+      });
+      if (p.urgent) html += '<div class="pa-note"><strong>' + escapeHtml_(p.urgent.name) + '</strong> is a recommended buy and looks like rising tonight.</div>';
+      return html;
+    }
+
+    function paletteLive_() {
+      var g = STATE.data && STATE.data.liveGameweek;
+      if (!g) return '<div class="pa-head">Live</div><div class="pa-note">No gameweek in progress — the next deadline has not passed yet.</div>';
+      var html = '<div class="pa-head">Gameweek ' + g.eventId + ' live</div>';
+      html += '<div class="pa-row"><span>Points so far</span><span class="num">' + g.pointsSoFar +
+        (g.average != null ? ' vs ' + g.average + ' avg' : '') + '</span></div>';
+      html += '<div class="pa-row"><span>Still to come</span><span class="num">' +
+        (g.playersYetToPlay + g.playersInPlay) + ' player' + ((g.playersYetToPlay + g.playersInPlay) === 1 ? '' : 's') + '</span></div>';
+      if (g.captain) {
+        html += '<div class="pa-row"><span>Captain ' + escapeHtml_(g.captain.name) + '</span>' +
+          '<span class="num">' + g.captain.contributed + ' pts</span></div>';
+      }
+      html += '<div class="pa-row"><span>On the bench</span><span class="num">' + g.benchPoints + ' pts</span></div>';
+      if (g.autosubsAvailable) html += '<div class="pa-note">Autosubs still to come — this score is not final.</div>';
+      else if (g.complete) html += '<div class="pa-note">Every fixture done; final once bonus is confirmed.</div>';
+      return html;
+    }
+
+    function paletteXi_() {
+      var l = STATE.data && STATE.data.lineup;
+      if (!l) return paletteNoData_('Best XI');
+      var html = '<div class="pa-head">Best legal XI — ' + escapeHtml_(l.formation) + '</div>';
+      html += '<div class="pa-row"><span>Projects</span><span class="num">' + l.projected + ' pts</span></div>';
+      html += '<div class="pa-row"><span>Your current eleven</span><span class="num">' + l.currentProjected + ' pts</span></div>';
+      (l.changes || []).forEach(function (c) {
+        html += '<div class="pa-row"><span>Start ' + escapeHtml_(c.inName) + ' over ' + escapeHtml_(c.outName) + '</span>' +
+          '<span class="num">+' + c.gain + '</span></div>';
+      });
+      if (!(l.changes || []).length) html += '<div class="pa-note">Your eleven is already the best legal one.</div>';
+      return html;
+    }
+
+    /* Comparison is the Ratings page's job — it already lines up four players
+     * and every component behind their scores. Deep-linking there beats
+     * rebuilding a worse version of it in a 620px overlay. */
+    function paletteCompare_(args) {
+      var names = (args || '').split(/[\s,]+/).filter(Boolean);
+      if (names.length < 1) return '<div class="pa-head">Compare</div><div class="pa-note">Name two players: <code>/compare Semenyo Stach</code></div>';
+      closePalette();
+      window.top.location.href = RATINGS_URL + '&compare=' + encodeURIComponent(names.slice(0, 4).join(','));
+      return null;
+    }
+
+    function paletteAsk_(question) {
+      if (!question) return '<div class="pa-head">Ask</div><div class="pa-note">Type a question after <code>/ask</code>.</div>';
+      if (!(STATE.data && STATE.data.hasAiKey)) {
+        return '<div class="pa-head">Ask</div><div class="pa-note">No AI key saved — add one in the AI Assistant section.</div>';
+      }
+      closePalette();
+      var input = document.getElementById('chatInput');
+      if (input) {
+        input.value = question;
+        var box = document.getElementById('chatLog');
+        if (box && box.scrollIntoView) box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        sendChat();
+      }
+      return null;
+    }
+
+    /* --- keyboard --- */
+
+    document.addEventListener('keydown', function (e) {
+      var key = String(e.key || '').toLowerCase();
+      if ((e.metaKey || e.ctrlKey) && key === 'k') {
+        e.preventDefault();
+        PALETTE.open ? closePalette() : openPalette();
+        return;
+      }
+      if (!PALETTE.open) return;
+      if (key === 'escape') { e.preventDefault(); closePalette(); return; }
+      if (key === 'arrowdown') {
+        e.preventDefault();
+        PALETTE.cursor = Math.min(PALETTE.cursor + 1, PALETTE.filtered.length - 1);
+        renderPaletteResults_();
+      } else if (key === 'arrowup') {
+        e.preventDefault();
+        PALETTE.cursor = Math.max(PALETTE.cursor - 1, 0);
+        renderPaletteResults_();
+      } else if (key === 'enter') {
+        e.preventDefault();
+        paletteRun_(PALETTE.cursor);
+      }
+    });
+
+    document.addEventListener('DOMContentLoaded', function () {
+      var input = document.getElementById('paletteInput');
+      if (input) input.addEventListener('input', function () { filterPalette_(this.value); });
+      var hint = document.getElementById('paletteKeyHint');
+      if (hint && !isMac_()) hint.textContent = 'Ctrl K';
+    });
+
+    /* ===================== SETUP CONTROLS ===================== */
+
+    function submitTeamId(inputId) {
+      var val = document.getElementById(inputId || 'teamIdInput').value.trim();
+      // Header "Refresh" button with an unchanged/blank field just reloads current data
+      // rather than erroring — only a genuinely new ID goes through saveTeamId.
+      if (!inputId && (!val || (STATE.data && val === String(STATE.data.teamId)))) {
+        loadDashboard(true);
+        return;
+      }
+      google.script.run.withSuccessHandler(function () { loadDashboard(); })
+        .withFailureHandler(function (err) {
+          var errEl = document.getElementById('setupError');
+          if (errEl) errEl.textContent = err.message || err;
+        })
+        .saveTeamId(val);
+    }
+
+    document.getElementById('riskSelect').addEventListener('change', function () {
+      google.script.run.withFailureHandler(function () {}).saveRiskAppetite(this.value);
+      loadDashboard();
+    });
+
+    loadDashboard();
+  </script>
+</body>
+</html>

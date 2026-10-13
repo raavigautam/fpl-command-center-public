@@ -1,0 +1,79 @@
+name: Model eval
+
+# Fetches FPL data, backtests the projection model against every finished
+# gameweek, and publishes the report to this run's summary page.
+#
+# Run it from anywhere: GitHub → Actions → "Model eval" → Run workflow
+# (works from a phone browser). The private deployment also runs it every six
+# hours so the pre-deadline player snapshots, which the FPL API cannot serve
+# after the fact, are never stale when a deadline passes; to do the same, add:
+#   schedule:
+#     - cron: '17 */6 * * *'
+#
+# Data and reports are committed to the `eval-data` branch, not main: main
+# stays code-only and a data commit can never trigger a deploy.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: model-eval
+  cancel-in-progress: false
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check out the data branch
+        env:
+          REPO_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
+        run: |
+          if git ls-remote --exit-code --heads origin eval-data >/dev/null 2>&1; then
+            git clone --depth 1 --branch eval-data "$REPO_URL" eval/data
+          else
+            mkdir -p eval/data
+            git -C eval/data init -b eval-data
+            git -C eval/data remote add origin "$REPO_URL"
+          fi
+
+      - name: Fetch FPL data
+        run: node eval/fetch.cjs eval/data
+
+      # The numbers below only mean something if the model code is sound.
+      - name: Unit tests
+        run: node test/run.cjs
+
+      - name: Backtest
+        run: node eval/backtest.cjs eval/data --out eval/data/reports --tune
+
+      - name: Publish report
+        if: always()
+        run: |
+          if [ -f eval/data/reports/latest.md ]; then
+            cat eval/data/reports/latest.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No report was produced — see the Backtest step log." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Commit data and report
+        if: always()
+        working-directory: eval/data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No new data."
+          else
+            git commit -m "Eval data $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push origin eval-data
+          fi

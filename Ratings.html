@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="FPL">
+  <meta name="theme-color" content="#f3f2f2">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <?!= include('Stylesheet'); ?>
+</head>
+<body>
+  <div class="page">
+    <header class="masthead">
+      <div class="rule rule-thick"></div>
+      <div class="masthead-row">
+        <h1 class="masthead-title"><a href="<?= appUrl ?>">The Command Centre</a></h1>
+        <div class="masthead-meta">
+          <div class="entry-name">Player Ratings</div>
+          <div id="genLabel">Loading the model…</div>
+        </div>
+      </div>
+      <div class="rule rule-thin"></div>
+      <div class="dateline">
+        <div class="dateline-left">
+          <span class="source-tag">Live</span>
+          <span id="countLabel"></span>
+          <span class="muted" style="font-size:11px" title="Deployed version (PR number, or commit if not a PR merge · UTC deploy date)"><?= appVersion ?></span>
+        </div>
+        <div class="dateline-controls">
+          <a class="link-btn" href="<?= appUrl ?>">← Back to dashboard</a>
+          <a class="link-btn" href="<?= appUrl ?>?page=wire">The Wire →</a>
+          <a class="link-btn" href="<?= appUrl ?>?page=debug">Debug →</a>
+        </div>
+      </div>
+    </header>
+
+    <main id="app">
+      <div class="loading">Scoring every player against live FPL data…</div>
+    </main>
+  </div>
+
+  <script>
+    var STATE = {
+      players: [], weights: null, sortKey: 'xpHorizon', sortDir: 'desc',
+      posFilter: 'ALL', search: '', expanded: null,
+      compare: [],        // player ids pinned for side-by-side comparison
+      squadOnly: false, availableOnly: false
+    };
+    var MAX_COMPARE = 4;
+    // Player names handed over from the dashboard's /compare command.
+    var COMPARE_PARAM = '<?= compareParam ?>';
+
+    function loadRatings() {
+      // getPredictionScoresJson(), not getPredictionScores(): this response is
+      // ~370KB as a nested object tree for a full player pool, against the
+      // ~35KB dashboard payload that was already being dropped in transit by
+      // google.script.run's object marshalling. A string crosses as a
+      // primitive, so that marshalling never runs.
+      google.script.run.withSuccessHandler(onDataJson_).withFailureHandler(renderError).getPredictionScoresJson();
+    }
+
+    function onDataJson_(json) {
+      if (!json) { renderError(new Error('The server returned no data. Try again.')); return; }
+      var parsed;
+      try {
+        parsed = JSON.parse(json);
+      } catch (e) {
+        renderError(new Error('The server response could not be read: ' + e.message));
+        return;
+      }
+      onData(parsed);
+    }
+
+    function renderError(err) {
+      document.getElementById('app').innerHTML =
+        '<p class="error-text">Something went wrong: ' + escapeHtml_(err.message || err) + '</p>' +
+        '<button onclick="loadRatings()">Try again</button>';
+    }
+
+    function escapeHtml_(s) {
+      return String(s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+
+    function onData(data) {
+      STATE.players = data.players;
+      STATE.weights = data.weights;
+      STATE.model = data.model || { name: 'v1', v2Weight: 0 };
+      // xpParts arrives as a bare array (see getPredictionScores); rebuild it.
+      var keys = data.xpPartsKeys || [];
+      STATE.players.forEach(function (p) {
+        if (!Array.isArray(p.xpParts)) return;
+        var o = {};
+        keys.forEach(function (k, i) { o[k] = p.xpParts[i]; });
+        o.penaltyTaker = o.penaltyTaker === 1;
+        p.xpParts = o;
+      });
+      STATE.horizonGws = data.horizonGws || 6;
+      document.getElementById('genLabel').textContent = 'Every player, scored the same way the dashboard scores yours';
+      document.getElementById('countLabel').textContent = data.players.length + ' players scored';
+      applyCompareDeepLink_();
+      renderApp();
+    }
+
+    /* The dashboard's palette sends "/compare Semenyo Stach" here as names,
+     * because it only holds the manager's own fifteen and this page holds
+     * every player in the game. Names rather than ids for the same reason:
+     * the sender does not know the ids of players it has never seen.
+     *
+     * Anything that fails to resolve is reported rather than dropped — a
+     * comparison silently missing one of the two players it was asked for is
+     * worse than one that says which name it could not place. */
+    function applyCompareDeepLink_() {
+      var raw = String(COMPARE_PARAM || '').trim();
+      if (!raw) return;
+      var wanted = raw.split(',').map(function (s) { return s.trim(); }).filter(Boolean).slice(0, MAX_COMPARE);
+      var missed = [];
+      wanted.forEach(function (name) {
+        var hit = matchPlayerByName_(name);
+        if (!hit) { missed.push(name); return; }
+        if (STATE.compare.indexOf(hit.id) === -1 && STATE.compare.length < MAX_COMPARE) STATE.compare.push(hit.id);
+      });
+      STATE.compareMissed = missed;
+      // Seed the table filter too, so the rows behind the comparison are the
+      // ones being compared rather than the default ranking.
+      if (wanted.length === 1) STATE.search = wanted[0];
+    }
+
+    /* Exact web_name first, then a prefix, then a substring — so "Sal" finds
+     * Salah without "Salah" being beaten by an unrelated player who happens
+     * to contain those letters. */
+    function matchPlayerByName_(name) {
+      var n = name.toLowerCase();
+      var list = STATE.players;
+      var exact = list.filter(function (p) { return p.name.toLowerCase() === n; });
+      if (exact.length) return exact[0];
+      var prefix = list.filter(function (p) { return p.name.toLowerCase().indexOf(n) === 0; });
+      if (prefix.length) return prefix.sort(function (a, b) { return b.xpHorizon - a.xpHorizon; })[0];
+      var sub = list.filter(function (p) { return p.name.toLowerCase().indexOf(n) !== -1; });
+      if (sub.length) return sub.sort(function (a, b) { return b.xpHorizon - a.xpHorizon; })[0];
+      return null;
+    }
+
+    function renderApp() {
+      var app = document.getElementById('app');
+      var html = '';
+      html += sectionMethod();
+      html += sectionCompare();
+      html += sectionControls();
+      app.innerHTML = html;
+      // The table lives INSIDE #tableHolder and is always redrawn whole. It
+      // used to be drawn once beside the holder, and every redraw (search,
+      // sort, expanding a row) wrote header-less <tr>s into the empty <div>,
+      // which the browser discards — so none of them ever showed.
+      rerenderTable();
+
+      document.getElementById('searchInput').addEventListener('input', function () {
+        STATE.search = this.value.trim().toLowerCase();
+        rerenderTable();
+      });
+    }
+
+    function sectionMethod() {
+      var html = '<section>';
+      html += '<div class="section-kicker">How this is scored</div>';
+      html += '<p class="ruling-body"><strong>xP</strong> is expected points — next gameweek, and across the next ' +
+        (STATE.horizonGws || 6) + '. It is what every transfer, lineup and captain call decides on. The app runs a ' +
+        '<strong>' + escapeHtml_(modelLabel_()) + '</strong>:</p>';
+      html += '<div class="method-row">' +
+        methodItem_('Underlying numbers (v2)', 'team xG for and against this fixture × his xG and xA per 90, clean-sheet chance, defensive contributions, saves, bonus, minutes') +
+        methodItem_('Points trend (v1)', 'form and points per game, pulled toward what his price implies, × fixture difficulty') +
+        '</div>';
+      html += '<p class="muted" style="font-size:13px">Tap a row for the breakdown, or <strong>Add</strong> up to ' + MAX_COMPARE +
+        ' players to compare them side by side. <strong>Score</strong> is an older ranking number kept as a tiebreak; it has no units.</p>';
+      html += '</section>';
+      return html;
+    }
+
+    /* ===================== COMPARE (side by side) =====================
+     *
+     * The table ranks players; it never let you put two of them next to each
+     * other. Comparing Saka to Ødegaard meant expanding one row, remembering
+     * the numbers, scrolling, and expanding another. Everything needed was
+     * already computed — this just lays it out in columns, with the better
+     * figure on each row marked so the comparison reads at a glance.
+     */
+
+    function comparePlayers_() {
+      return STATE.compare.map(function (id) {
+        return STATE.players.filter(function (p) { return p.id === id; })[0];
+      }).filter(Boolean);
+    }
+
+    function toggleCompare(id, ev) {
+      if (ev && ev.stopPropagation) ev.stopPropagation();
+      var idx = STATE.compare.indexOf(id);
+      if (idx !== -1) STATE.compare.splice(idx, 1);
+      else if (STATE.compare.length < MAX_COMPARE) STATE.compare.push(id);
+      renderApp();
+    }
+
+    function clearCompare() {
+      STATE.compare = [];
+      renderApp();
+    }
+
+    /* One row of the comparison. `num` drives the best-in-row highlight;
+     * rows where "higher" is not better (price, ownership) return null. */
+    /* The model the app actually decides on, in words, for headings. */
+    function modelLabel_() {
+      var m = STATE.model || {};
+      if (m.name === 'blend') return Math.round(m.v2Weight * 100) + '% underlying-numbers model, ' + Math.round((1 - m.v2Weight) * 100) + '% points-trend model';
+      return m.name === 'v2' ? 'underlying-numbers model' : 'points-trend model';
+    }
+
+    /* One number from a player's xpParts, formatted; `better` says which way is good. */
+    function part_(key, opts) {
+      opts = opts || {};
+      return function (p) {
+        var x = p.xpParts || {};
+        var v = x[key];
+        if (v == null) return { text: '\u2014', num: null };
+        var text = opts.pct ? Math.round(v * 100) + '%' : (opts.signed && v > 0 ? '+' : '') + Number(v).toFixed(opts.dp != null ? opts.dp : 2);
+        return { text: text, num: opts.lowerBetter ? -v : v };
+      };
+    }
+
+    function compareRows_() {
+      return [
+        { label: 'Club', get: function (p) { return { text: p.team + ' · ' + p.position, num: null }; } },
+        { label: 'Price', get: function (p) { return { text: '£' + p.price.toFixed(1) + 'm', num: null }; } },
+        { label: 'In your squad', get: function (p) { return { text: p.inSquad ? 'Yes' : '—', num: null }; } },
+        { label: 'Owned by', get: function (p) { return { text: (p.ownership != null ? p.ownership.toFixed(1) + '%' : '—'), num: null }; } },
+        { label: 'Availability', get: function (p) { return { text: p.statusLabel, num: null }; } },
+        { label: 'Next fixtures', get: function (p) { return { text: (p.nextOpponents || []).join(', ') || '—', num: null }; } },
+        { divider: 'The decision numbers' },
+        { label: 'xP next gameweek', get: function (p) { return { text: p.xpNext.toFixed(2), num: p.xpNext }; } },
+        { label: 'xP next ' + (STATE.horizonGws || 6) + ' gameweeks', get: function (p) { return { text: p.xpHorizon.toFixed(2), num: p.xpHorizon }; } },
+        { label: 'xP per £m', get: function (p) { return { text: p.value.toFixed(2), num: p.value }; } },
+        { label: 'Rank in position', get: function (p) { return { text: p.positionRank + ' of ' + p.positionCount, num: -p.positionRank }; } },
+        { label: 'vs position median', get: function (p) { return { text: p.vsPositionMedian != null ? '×' + p.vsPositionMedian.toFixed(2) : '—', num: p.vsPositionMedian }; } },
+        { label: 'Verdict', get: function (p) { return { text: p.recommendation, num: null }; } },
+        { divider: 'Where the xP comes from — next gameweek' },
+        { label: 'Points-trend model (v1)', get: part_('v1') },
+        { label: 'Underlying-numbers model (v2)', get: part_('v2') },
+        { label: 'Used by the app (blend)', get: part_('blend') },
+        { divider: 'v2, by scoring rule' },
+        { label: 'Appearance', get: part_('appearance') },
+        { label: 'Goals', get: part_('goals') },
+        { label: 'Assists', get: part_('assists') },
+        { label: 'Clean sheet', get: part_('cleanSheet') },
+        { label: 'Goals conceded', get: part_('conceded') },
+        { label: 'Saves', get: part_('saves') },
+        { label: 'Defensive contribution', get: part_('defensive') },
+        { label: 'Bonus', get: part_('bonus') },
+        { divider: 'The inputs' },
+        { label: 'His team\u2019s xG this match', get: part_('teamXg') },
+        { label: 'Opponent\u2019s xG against them', get: part_('opponentXg', { lowerBetter: true }) },
+        { label: 'Clean-sheet chance', get: part_('csChance', { pct: true }) },
+        { label: 'xG per 90', get: part_('xg90') },
+        { label: 'xA per 90', get: part_('xa90') },
+        { label: 'Defensive actions per 90', get: part_('dc90', { dp: 1 }) },
+        { label: 'Chance of reaching the DC threshold', get: part_('dcChance', { pct: true }) },
+        { label: 'Chance of playing 60+', get: part_('p60', { pct: true }) },
+        { label: 'Ranking score (tiebreak, no units)', get: function (p) { return { text: p.score.toFixed(2), num: p.score }; } },
+        { label: 'Penalty taker', get: function (p) { var x = p.xpParts || {}; return { text: x.v2 == null ? '\u2014' : (x.penaltyTaker ? 'Yes' : 'No'), num: null }; } },
+        { divider: 'In plain language' },
+        { label: 'Read', get: function (p) { return { text: p.reason, num: null, wide: true }; } }
+      ];
+    }
+
+    function sectionCompare() {
+      var picked = comparePlayers_();
+      var missed = STATE.compareMissed || [];
+      if (!picked.length && !missed.length) return '';
+
+      var html = '<section><div class="section-heading">Head to head</div>';
+      if (missed.length) {
+        html += '<p class="error-text" style="margin-bottom:var(--space-3)">Could not find ' +
+          missed.map(function (n) { return '\u201c' + escapeHtml_(n) + '\u201d'; }).join(' or ') +
+          ' \u2014 names are matched against the short name FPL uses on the shirt. Search the table below and add them manually.</p>';
+      }
+      if (!picked.length) return html + '</section>';
+      if (picked.length === 1) {
+        html += '<p class="muted" style="margin-bottom:var(--space-3)">Pick up to ' + (MAX_COMPARE - 1) +
+          ' more from the table below to compare against ' + escapeHtml_(picked[0].name) + '.</p>';
+      } else {
+        html += '<p class="muted" style="margin-bottom:var(--space-3)">Best figure on each row is marked. ' +
+          'These are the same numbers the dashboard uses to pick your transfers. Scroll sideways if the table is wider than your screen.</p>';
+      }
+
+      html += '<div class="table-scroll"><table class="table compare-table"><thead><tr><th></th>';
+      picked.forEach(function (p) {
+        html += '<th><span class="compare-name">' + escapeHtml_(p.name) + '</span>' +
+          (p.inSquad ? '<span class="own-mark" title="In your squad">·</span>' : '') +
+          '<button class="link-btn" style="display:block;margin-top:4px" onclick="toggleCompare(' + p.id + ', event)">Remove</button></th>';
+      });
+      html += '</tr></thead><tbody>';
+
+      compareRows_().forEach(function (row) {
+        if (row.divider) {
+          html += '<tr class="compare-divider"><td colspan="' + (picked.length + 1) + '">' + escapeHtml_(row.divider) + '</td></tr>';
+          return;
+        }
+        var cells = picked.map(function (p) { return row.get(p); });
+        var best = null;
+        cells.forEach(function (c) { if (c.num != null && (best === null || c.num > best)) best = c.num; });
+        // Only mark a winner when there is one — if every player ties, nothing
+        // is highlighted rather than all of them.
+        var allTied = cells.every(function (c) { return c.num == null || c.num === best; });
+        html += '<tr><td class="compare-label">' + escapeHtml_(row.label) + '</td>';
+        cells.forEach(function (c) {
+          var isBest = c.num != null && best !== null && c.num === best && !allTied && picked.length > 1;
+          html += '<td class="' + (row.wide ? 'compare-wide' : 'num') + (isBest ? ' delta-rise' : '') + '">' +
+            escapeHtml_(String(c.text)) + '</td>';
+        });
+        html += '</tr>';
+      });
+
+      html += '</tbody></table></div>';
+      html += '<button class="btn" style="margin-top:var(--space-3)" onclick="clearCompare()">Clear comparison</button>';
+      html += '</section>';
+      return html;
+    }
+
+    function methodItem_(label, figure) {
+      return '<div><div class="weight-figure">' + escapeHtml_(figure) + '</div>' +
+        '<div class="weight-label">' + escapeHtml_(label) + '</div></div>';
+    }
+
+    function sectionControls() {
+      var html = '<div class="ratings-controls">';
+      html += '<div class="filter-pills" id="posFilters">';
+      ['ALL', 'GKP', 'DEF', 'MID', 'FWD'].forEach(function (pos) {
+        html += '<button class="pill pill-btn' + (STATE.posFilter === pos ? ' active' : '') + '" data-pos="' + pos + '" onclick="setPosFilter(\'' + pos + '\')">' + pos + '</button>';
+      });
+      html += '</div>';
+      html += '<div class="filter-pills">';
+      html += '<button class="pill pill-btn' + (STATE.squadOnly ? ' active' : '') + '" onclick="toggleSquadOnly()">My squad</button>';
+      html += '<button class="pill pill-btn' + (STATE.availableOnly ? ' active' : '') + '" onclick="toggleAvailableOnly()">Available only</button>';
+      html += '</div>';
+      html += '<input type="search" id="searchInput" placeholder="Search player or club…" value="' + escapeHtml_(STATE.search) + '">';
+      html += '</div>';
+      // Ten columns of serif at 14px needs ~900px. Without a scroll container
+      // the body itself scrolls sideways on a phone, which the design brief
+      // rules out — wide content scrolls inside its own box (the fixture grid
+      // and the Debug log already do this).
+      html += '<div class="table-scroll" id="tableHolder"></div>';
+      return html;
+    }
+
+    function setPosFilter(pos) {
+      STATE.posFilter = pos;
+      STATE.expanded = null;
+      renderApp();
+    }
+
+    function toggleSquadOnly() {
+      STATE.squadOnly = !STATE.squadOnly;
+      STATE.expanded = null;
+      renderApp();
+    }
+
+    function toggleAvailableOnly() {
+      STATE.availableOnly = !STATE.availableOnly;
+      STATE.expanded = null;
+      renderApp();
+    }
+
+    function filteredSortedPlayers_() {
+      var list = STATE.players.filter(function (p) {
+        if (STATE.posFilter !== 'ALL' && p.position !== STATE.posFilter) return false;
+        if (STATE.squadOnly && !p.inSquad) return false;
+        if (STATE.availableOnly && p.status !== 'a') return false;
+        if (STATE.search) {
+          var hay = (p.name + ' ' + p.team).toLowerCase();
+          if (hay.indexOf(STATE.search) === -1) return false;
+        }
+        return true;
+      });
+      var key = STATE.sortKey, dir = STATE.sortDir === 'asc' ? 1 : -1;
+      list.sort(function (a, b) {
+        var av = key === 'name' ? a.name.toLowerCase() : a[key];
+        var bv = key === 'name' ? b.name.toLowerCase() : b[key];
+        if (av < bv) return -1 * dir;
+        if (av > bv) return 1 * dir;
+        return 0;
+      });
+      return list;
+    }
+
+    function sortBy(key) {
+      if (STATE.sortKey === key) {
+        STATE.sortDir = STATE.sortDir === 'desc' ? 'asc' : 'desc';
+      } else {
+        STATE.sortKey = key;
+        STATE.sortDir = 'desc';
+      }
+      STATE.expanded = null;
+      rerenderTable();
+    }
+
+    function rerenderTable() {
+      document.getElementById('tableHolder').innerHTML = sectionTable(false);
+    }
+
+    var COLUMNS = [
+      { key: 'name', label: 'Player' },
+      { key: 'team', label: 'Club' },
+      { key: 'position', label: 'Pos' },
+      { key: 'price', label: 'Price' },
+      { key: 'xpNext', label: 'xP next' },
+      { key: 'xpHorizon', label: 'xP horizon' },
+      // Was "Value (pts/£m)" while actually computing score/price — score is
+      // a dimensionless ranking number, so that column's units were nothing
+      // at all, presented as points. It is expected points per million now,
+      // which is what the label always claimed.
+      { key: 'value', label: 'xP per £m' },
+      { key: 'ownership', label: 'Owned %' },
+      { key: 'score', label: 'Score' }
+    ];
+
+    function sectionTable(bodyOnly) {
+      var list = filteredSortedPlayers_();
+      var head = '';
+      if (!bodyOnly) {
+        head = '<table class="table"><thead><tr>';
+        COLUMNS.forEach(function (c) {
+          var active = STATE.sortKey === c.key;
+          head += '<th class="sortable' + (active ? ' active' : '') + '" onclick="sortBy(\'' + c.key + '\')">' +
+            c.label + (active ? '<span class="arrow">' + (STATE.sortDir === 'desc' ? '↓' : '↑') + '</span>' : '') + '</th>';
+        });
+        head += '<th>Next</th><th>Recommendation</th><th>Compare</th></tr></thead><tbody>';
+      }
+
+      var body = '';
+      if (!list.length) {
+        body = '<tr><td colspan="12" class="muted" style="padding:var(--space-4) 0">No players match this filter.</td></tr>';
+      } else {
+        list.forEach(function (p) {
+          // "Flagged" is availability news, not a verdict on quality — it gets
+          // the neutral tone, and the loud one is reserved for a genuine Avoid.
+          var recTone = p.recommendation === 'Strong Buy' || p.recommendation === 'Consider' ? 'pill-cool' :
+            (p.recommendation === 'Avoid' ? 'pill-hot' : 'pill-warm');
+          var pinned = STATE.compare.indexOf(p.id) !== -1;
+          var full = !pinned && STATE.compare.length >= MAX_COMPARE;
+          body += '<tr class="rating-row' + (p.inSquad ? ' owned-row' : '') + '" onclick="toggleExpand(' + p.id + ')">' +
+            '<td>' + escapeHtml_(p.name) +
+              (p.inSquad ? '<span class="own-mark" title="In your squad">·</span>' : '') +
+              (p.status !== 'a' ? ' <span class="pill pill-hot" style="margin-left:6px">' + escapeHtml_(p.statusLabel) + '</span>' : '') + '</td>' +
+            '<td>' + escapeHtml_(p.team) + '</td>' +
+            '<td>' + p.position + '</td>' +
+            '<td class="num">£' + p.price.toFixed(1) + 'm</td>' +
+            '<td class="num">' + (p.xpNext != null ? p.xpNext.toFixed(1) : '—') + '</td>' +
+            '<td class="num">' + (p.xpHorizon != null ? p.xpHorizon.toFixed(1) : '—') + '</td>' +
+            '<td class="num">' + p.value.toFixed(1) + '</td>' +
+            '<td class="num">' + (p.ownership != null ? p.ownership.toFixed(1) : '—') + '</td>' +
+            '<td class="num">' + p.score.toFixed(1) + '</td>' +
+            '<td class="fixtures-cell">' + escapeHtml_((p.nextOpponents || []).slice(0, 3).join(' ')) + '</td>' +
+            '<td><span class="pill ' + recTone + '">' + escapeHtml_(p.recommendation) + '</span></td>' +
+            '<td><button class="pill pill-btn' + (pinned ? ' active' : '') + '"' + (full ? ' disabled' : '') +
+              ' onclick="toggleCompare(' + p.id + ', event)">' + (pinned ? 'Added' : 'Add') + '</button></td>' +
+            '</tr>';
+          if (STATE.expanded === p.id) {
+            body += '<tr class="detail-row"><td colspan="12">' + breakdownHtml_(p) + '</td></tr>';
+          }
+        });
+      }
+
+      if (bodyOnly) return body;
+      return head + body + '</tbody></table>';
+    }
+
+    function toggleExpand(id) {
+      STATE.expanded = STATE.expanded === id ? null : id;
+      rerenderTable();
+    }
+
+    function contribution_(input, weight) {
+      return Math.round(input * weight * 100) / 100;
+    }
+
+    function breakdownHtml_(p) {
+      var x = p.xpParts || {};
+      var line = function (label, v, total) {
+        return '<div class="breakdown-line' + (total ? ' breakdown-total' : '') + '"><span>' + escapeHtml_(label) + '</span><span>' +
+          (v == null ? '—' : v) + '</span></div>';
+      };
+      var f2 = function (v) { return v == null ? null : Number(v).toFixed(2); };
+      var pct = function (v) { return v == null ? null : Math.round(v * 100) + '%'; };
+      var html = '';
+      if (x.v2 != null) {
+        html += '<div class="breakdown-head">Underlying-numbers model (v2), next gameweek</div>';
+        html += line('Appearance (' + pct(x.p60) + ' chance of 60+)', f2(x.appearance));
+        html += line('Goals (' + f2(x.xg90) + ' xG per 90' + (x.penaltyTaker ? ', on penalties' : '') + ')', f2(x.goals));
+        html += line('Assists (' + f2(x.xa90) + ' xA per 90)', f2(x.assists));
+        if (p.position !== 'FWD') html += line('Clean sheet (' + pct(x.csChance) + ' chance)', f2(x.cleanSheet));
+        if (p.position === 'GKP' || p.position === 'DEF') html += line('Goals conceded', f2(x.conceded));
+        if (p.position === 'GKP') html += line('Saves', f2(x.saves));
+        if (p.position !== 'GKP') html += line('Defensive contribution (' + (x.dc90 != null ? x.dc90.toFixed(1) : '—') + ' a match, ' + pct(x.dcChance) + ' to reach it)', f2(x.defensive));
+        html += line('Bonus', f2(x.bonus));
+        html += line('v2 total', f2(x.v2), true);
+        html += '<p class="muted" style="font-size:12.5px;margin:4px 0 var(--space-2)">His team’s expected goals this match ' + f2(x.teamXg) +
+          '; the opponent’s ' + f2(x.opponentXg) + '.</p>';
+      }
+      html += '<div class="breakdown-head">Points-trend model (v1), next gameweek</div>';
+      html += line('Points rate (form and points per game, pulled toward his price)', f2(x.v1Base));
+      html += line('× Fixture', x.v1Fixture != null ? '×' + x.v1Fixture : null);
+      html += line('× Start rate', x.v1Start != null ? '×' + x.v1Start : null);
+      html += line('× Availability', x.availability != null ? '×' + x.availability : null);
+      html += line('v1 total', f2(x.v1), true);
+      var m = STATE.model || {};
+      html += '<div class="breakdown-head">What the app uses' + (m.name === 'blend' ? ' (' + Math.round(m.v2Weight * 100) + '% v2)' : '') + '</div>';
+      html += line('Next gameweek', f2(p.xpNext), true);
+      html += line('Next ' + (STATE.horizonGws || 6) + ' gameweeks', f2(p.xpHorizon));
+      html += '<p class="ruling-body" style="font-size:14px;margin-top:var(--space-3);margin-bottom:0">' + escapeHtml_(p.reason) + '</p>';
+      if (p.nextOpponents && p.nextOpponents.length) {
+        html += '<p class="muted" style="font-size:13px;margin-top:6px">Next: ' + escapeHtml_(p.nextOpponents.join(', ')) + '</p>';
+      }
+      return html;
+    }
+
+    function breakdownLine_(label, comp) {
+      return '<div class="breakdown-line"><span>' + escapeHtml_(label) + ' (' + comp.input + ' × ' + comp.weight + ')</span><span>' + comp.contribution + '</span></div>';
+    }
+
+    loadRatings();
+  </script>
+</body>
+</html>

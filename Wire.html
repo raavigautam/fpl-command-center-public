@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="FPL">
+  <meta name="theme-color" content="#f3f2f2">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <?!= include('Stylesheet'); ?>
+</head>
+<body>
+  <div class="page">
+    <header class="masthead">
+      <div class="rule rule-thick"></div>
+      <div class="masthead-row">
+        <h1 class="masthead-title"><a href="<?= appUrl ?>">The Command Centre</a></h1>
+        <div class="masthead-meta">
+          <div class="entry-name">The Wire</div>
+          <div id="genLabel">Loading outside signal…</div>
+        </div>
+      </div>
+      <div class="rule rule-thin"></div>
+      <div class="dateline">
+        <div class="dateline-left">
+          <span class="source-tag">Live</span>
+          <span class="muted" style="font-size:11px" title="Deployed version (PR number, or commit if not a PR merge · UTC deploy date)"><?= appVersion ?></span>
+        </div>
+        <div class="dateline-controls">
+          <a class="link-btn" href="<?= appUrl ?>">← Back to dashboard</a>
+          <a class="link-btn" href="<?= appUrl ?>?page=ratings">Player Ratings →</a>
+          <a class="link-btn" href="<?= appUrl ?>?page=debug">Debug →</a>
+        </div>
+      </div>
+    </header>
+
+    <main id="app">
+      <div class="loading">Pulling The Panel…</div>
+    </main>
+  </div>
+
+  <script>
+    var STATE = { data: null, lastDiag: null };
+
+    function loadWire() {
+      google.script.run.withSuccessHandler(onData).withFailureHandler(renderError).getWireData();
+    }
+
+    function renderError(err) {
+      document.getElementById('app').innerHTML =
+        '<p class="error-text">Something went wrong: ' + escapeHtml_(err.message || err) + '</p>' +
+        '<button onclick="loadWire()">Try again</button>';
+    }
+
+    function escapeHtml_(s) {
+      return String(s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+
+    function timeAgo_(iso) {
+      if (!iso) return 'recently';
+      var days = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
+      if (days <= 0) return 'today';
+      if (days === 1) return '1 day ago';
+      if (days < 14) return days + ' days ago';
+      var weeks = Math.floor(days / 7);
+      return weeks + (weeks === 1 ? ' week ago' : ' weeks ago');
+    }
+
+    function timeAgoUnix_(epochSeconds) {
+      return epochSeconds ? timeAgo_(new Date(epochSeconds * 1000).toISOString()) : 'recently';
+    }
+
+    function onData(data) {
+      STATE.data = data;
+      document.getElementById('genLabel').textContent =
+        'Everything this dashboard reads from outside its own algorithm — folded into scoring as community signal, not just shown here.';
+      renderApp();
+    }
+
+    function renderApp() {
+      var app = document.getElementById('app');
+      var html = '';
+      html += sectionConsensus(STATE.data);
+      html += sectionPanel(STATE.data);
+      html += sectionByPlayer(STATE.data);
+      html += sectionDiagnostics(STATE.data);
+      app.innerHTML = html;
+    }
+
+    /* ===================== CONSENSUS (what the channels agree on) ===================== */
+
+    function sectionConsensus(data) {
+      var c = data.panelConsensus;
+      if (!c || !c.picks || !c.picks.length) return '';
+      var html = '<section><div class="section-heading">This week\'s consensus</div>';
+      html += '<div class="ruling-body">' + escapeHtml_(c.summary) + '</div>';
+
+      html += '<div class="stat-band">' +
+        '<div><div class="stat-figure">' + c.videoCount + '</div><div class="stat-label">Videos read in the last ' + c.windowDays + ' days</div></div>' +
+        '<div><div class="stat-figure">' + c.channelCount + '</div><div class="stat-label">Channels tracked</div></div>' +
+        '<div><div class="stat-figure">' + c.agreedCount + '</div><div class="stat-label">Calls more than one channel landed on</div></div>' +
+        '</div>';
+
+      c.picks.forEach(function (p) {
+        var tone = p.channelCount > 1 ? 'pill-cool' : 'pill-warm';
+        html += '<div class="list-row"><span class="name">' + escapeHtml_(p.label) +
+          ' <span class="meta">' + escapeHtml_(p.channels.join(', ')) + '</span></span>' +
+          '<span class="' + (p.channelCount > 1 ? 'delta-rise' : 'meta') + '">' +
+          p.channelCount + ' channel' + (p.channelCount === 1 ? '' : 's') + ' &middot; ' +
+          p.videos + ' video' + (p.videos === 1 ? '' : 's') + '</span></div>';
+        var verdict = p.agrees && !p.differs ? 'Agrees with the Ruling'
+          : (p.differs && !p.agrees ? 'Differs from the Ruling' + (p.note ? ' — ' + p.note : '')
+            : p.agrees + ' agree, ' + p.differs + ' differ');
+        html += '<div class="player-why" style="margin-bottom:var(--space-2)"><span class="pill ' + tone +
+          '" style="margin-right:8px">' + escapeHtml_(verdict) + '</span></div>';
+      });
+
+      html += '<p class="caveat">Agreement between independent channels is the part worth weighting — one analyst posting three videos is volume, not consensus. Both counts feed the community-signal term in scoring, with the channel count carrying more of it.</p>';
+      html += '</section>';
+      return html;
+    }
+
+    /* ===================== BY PLAYER (every logged Panel pick, from a Sheet) ===================== */
+
+    function sectionByPlayer(data) {
+      var list = data.playerRecs || [];
+      var html = '<section><div class="section-kicker">By Player</div>';
+      html += '<p class="ruling-body" style="margin-bottom:var(--space-2)">Every player The Panel has ever backed, in one ' +
+        'place — who recommended them, and why. Logged to a Sheet as each video is processed, so this is the full history, ' +
+        'not just the current week above.</p>';
+      if (data.recSheetUrl) {
+        html += '<p class="muted" style="margin-bottom:var(--space-4)"><a href="' + escapeHtml_(data.recSheetUrl) + '" target="_blank">Open the underlying Sheet →</a></p>';
+      }
+
+      if (!list.length) {
+        if (data.recSheetError) {
+          html += '<p class="error-text">The log Sheet could not be opened or created: ' + escapeHtml_(data.recSheetError) + '</p>' +
+            '<p class="muted" style="margin-top:var(--space-2)">This is usually a permissions problem rather than an empty feed — ' +
+            'the deployment needs Google Sheets access. Open the Apps Script editor, run any function once, and approve the ' +
+            'prompt, then redeploy. Everything else on this page works without it; only this history does not.</p></section>';
+        } else {
+          html += '<p class="muted">Nothing logged yet — run the Diagnostics checks below, or wait for the automatic timers.</p></section>';
+        }
+        return html;
+      }
+
+      list.forEach(function (p) {
+        html += '<div class="rec-row panel-row"><div>' +
+          '<div class="panel-headline">' + escapeHtml_(p.player) +
+          ' <span class="muted" style="font-size:13px;font-weight:400">(' + p.count + ' mention' + (p.count === 1 ? '' : 's') + ')</span></div>';
+        p.recommendations.forEach(function (r) {
+          var tone = r.verdict === 'Agrees' ? 'pill-cool' : (r.verdict === 'Differs' ? 'pill-hot' : 'pill-warm');
+          html += '<p class="rec-reason" style="margin-top:6px;font-size:14px">' +
+            '<span class="pill ' + tone + '" style="margin-right:8px">' + escapeHtml_(r.verdict) + '</span>' +
+            escapeHtml_(r.sourceName) + ' — ' + escapeHtml_(r.reasoning) +
+            (r.sourceUrl ? ' <a href="' + escapeHtml_(r.sourceUrl) + '" target="_blank">↗</a>' : '') +
+            '</p>';
+        });
+        html += '</div></div>';
+      });
+
+      html += '</section>';
+      return html;
+    }
+
+    /* ===================== THE PANEL (expert YouTube takes) ===================== */
+
+    function sectionPanel(data) {
+      var html = '<section>';
+      html += '<div class="section-kicker">The Panel</div>';
+
+      if (!data.hasYoutubeKey || !data.hasGeminiKey || !data.hasAiKey) {
+        html += '<p class="ruling-body" style="margin-bottom:var(--space-2)">Every video the tracked FPL YouTube channels ' +
+          'posted in the last week, read and cross-checked against the dashboard\'s own Ruling — agrees or differs, at a ' +
+          'glance. Feeds back into the main dashboard\'s scoring as community signal, not just shown here.</p>' +
+          '<p class="muted" style="margin-bottom:var(--space-3)">Needs three keys, all free: a YouTube Data API key ' +
+          '(<a href="https://console.cloud.google.com/apis/library/youtube.googleapis.com" target="_blank">Google Cloud Console →</a>), ' +
+          'a Gemini API key (<a href="https://aistudio.google.com/apikey" target="_blank">Google AI Studio →</a>), and ' +
+          'an Anthropic API key (<a href="https://console.anthropic.com/settings/keys" target="_blank">Anthropic Console →</a>, ' +
+          'entered on the main dashboard\'s AI Assistant section — it writes the synthesis).</p>';
+        if (!data.hasYoutubeKey) {
+          html += '<input type="password" id="youtubeKeyInput" placeholder="YouTube Data API key">' +
+            '<button onclick="submitYoutubeKey()">Save</button>' +
+            '<p class="error-text" id="youtubeKeyError"></p>';
+        }
+        if (!data.hasGeminiKey) {
+          html += '<input type="password" id="geminiKeyInput" placeholder="Gemini API key" style="margin-top:var(--space-2)">' +
+            '<button onclick="submitGeminiKey()">Save</button>' +
+            '<p class="error-text" id="geminiKeyError"></p>';
+        }
+        html += '</section>';
+        return html;
+      }
+
+      var entries = data.panel || [];
+      if (!entries.length) {
+        html += '<p class="muted">No takes inside the current window — tracked channels are checked every few hours, and anything older than a week ages out.</p></section>';
+        return html;
+      }
+
+      var windowDays = (data.panelConsensus && data.panelConsensus.windowDays) || 7;
+      html += '<p class="muted" style="margin-bottom:var(--space-4)">Every tracked channel\'s videos from the last ' +
+        windowDays + ' days, newest first — not just the latest one each. Each is read once and cross-checked against the dashboard\'s own Ruling.</p>';
+
+      entries.forEach(function (e) {
+        html += '<div class="rec-row panel-row"><div>' +
+          '<div class="panel-byline">— ' + escapeHtml_(e.channelName) + ', posted ' + timeAgo_(e.publishedAt) +
+          (e.videoTitle ? ' &middot; ' + escapeHtml_(e.videoTitle) : '') + '</div>' +
+          '<div class="panel-headline">' + escapeHtml_(e.headline) + '</div>' +
+          '<div class="rec-reason" style="font-size:15px">' + escapeHtml_(e.body) + '</div>';
+        if (e.picks && e.picks.length) {
+          html += '<div class="panel-pills">' + e.picks.map(function (p) {
+            var verdict = p.agrees ? 'Agrees with the Ruling' : ('Differs' + (p.note ? ' — ' + p.note : ''));
+            return '<span class="pill ' + (p.agrees ? 'pill-cool' : 'pill-hot') + '">' + escapeHtml_(p.label) + ' — ' + escapeHtml_(verdict) + '</span>';
+          }).join('') + '</div>';
+        }
+        html += '<a class="panel-link" href="' + escapeHtml_(e.videoUrl) + '" target="_blank">Watch on YouTube →</a>';
+        html += '</div></div>';
+      });
+
+      html += '</section>';
+      return html;
+    }
+
+    function submitYoutubeKey() {
+      var val = document.getElementById('youtubeKeyInput').value;
+      google.script.run.withSuccessHandler(function () { loadWire(); })
+        .withFailureHandler(function (err) { document.getElementById('youtubeKeyError').textContent = err.message || err; })
+        .saveYoutubeKey(val);
+    }
+
+    function submitGeminiKey() {
+      var val = document.getElementById('geminiKeyInput').value;
+      google.script.run.withSuccessHandler(function () { loadWire(); })
+        .withFailureHandler(function (err) { document.getElementById('geminiKeyError').textContent = err.message || err; })
+        .saveGeminiKey(val);
+    }
+
+    /* ===================== DIAGNOSTICS (manual run, no Apps Script editor needed) ===================== */
+
+    var DIAG_LABELS = {
+      debugPanel: 'Panel channel check',
+      debugWeeklyVerdict: 'Force verdict refresh check',
+      installPanelTrigger: 'Install Panel trigger (6-hourly)',
+      installWeeklyTrigger: 'Install Weekly trigger (reminders + verdict, 6-hourly)'
+    };
+
+    function sectionDiagnostics(data) {
+      var html = '<section><div class="rule rule-thin"></div><div style="margin-top:var(--space-6)">';
+      html += '<div class="section-kicker">Diagnostics</div>';
+      html += '<p class="muted" style="margin-bottom:var(--space-3)">Force a check right now instead of waiting for the ' +
+        'automatic timers, and see the raw result or error here — no need to open the Apps Script editor.</p>';
+      html += triggerStatusHtml_(data.triggerStatus);
+      html += '<div style="display:flex;flex-wrap:wrap;gap:var(--space-2);margin-bottom:var(--space-3)">';
+      Object.keys(DIAG_LABELS).forEach(function (fn) {
+        html += '<button class="btn" id="diagBtn_' + fn + '" onclick="runDiagnostic(\'' + fn + '\')">' + escapeHtml_(DIAG_LABELS[fn]) + '</button>';
+      });
+      // Reinjected on every render (including the reload after a run finishes) so
+      // the result/error stays visible instead of disappearing under the refresh.
+      html += '</div><div id="diagResult">' + (STATE.lastDiag ? diagResultHtml_(STATE.lastDiag.fnName, STATE.lastDiag.result, STATE.lastDiag.err) : '') + '</div></div></section>';
+      return html;
+    }
+
+    // The Panel already shows its own freshness inline ("posted X ago" /
+    // "posted X ago") above — this exists for the one pipeline that had no
+    // visibility at all: if installWeeklyTrigger() was never run (or a
+    // redeploy wiped it), the deadline email and verdict auto-refresh just
+    // go quiet forever with nothing in the app to notice. Surfaced from
+    // getTriggerStatus_() in Code.js.
+    function triggerStatusHtml_(status) {
+      if (!status) return '';
+      var badge = function (ok, label) {
+        return '<span class="pill ' + (ok ? 'pill-cool' : 'pill-hot') + '" style="margin-right:var(--space-2)">' +
+          escapeHtml_(label) + ': ' + (ok ? 'installed' : 'NOT installed') + '</span>';
+      };
+      var html = '<div style="margin-bottom:var(--space-3)">';
+      html += badge(status.weeklyInstalled, 'Weekly (reminders + verdict)');
+      html += badge(status.panelInstalled, 'Panel (6-hourly)');
+      if (status.lastEmailedEvent) {
+        html += '<span class="muted" style="display:block;margin-top:var(--space-1)">Last deadline email sent for GW' + escapeHtml_(status.lastEmailedEvent) + '.</span>';
+      }
+      html += '</div>';
+      return html;
+    }
+
+    function runDiagnostic(fnName) {
+      var btn = document.getElementById('diagBtn_' + fnName);
+      if (btn) btn.disabled = true;
+      document.getElementById('diagResult').innerHTML = '<p class="muted">Running ' + escapeHtml_(DIAG_LABELS[fnName] || fnName) + '…</p>';
+      google.script.run
+        .withSuccessHandler(function (result) { onDiagDone_(fnName, result, null); })
+        .withFailureHandler(function (err) { onDiagDone_(fnName, null, err); })
+        [fnName]();
+    }
+
+    function onDiagDone_(fnName, result, err) {
+      STATE.lastDiag = { fnName: fnName, result: result, err: err };
+      var out = document.getElementById('diagResult');
+      if (out) out.innerHTML = diagResultHtml_(fnName, result, err);
+      loadWire(); // refresh the sections above with whatever's now cached; sectionDiagnostics() re-shows this same result
+    }
+
+    function diagResultHtml_(fnName, result, err) {
+      var label = DIAG_LABELS[fnName] || fnName;
+
+      if (err) {
+        return '<p class="error-text">' + escapeHtml_(label) + ' failed: ' + escapeHtml_(err.message || err) + '</p>';
+      }
+
+      var html = '<p class="muted">' + escapeHtml_(label) + ' finished.</p>';
+      if (fnName === 'debugPanel') {
+        if (!result) {
+          html += '<p class="muted">No result — likely a missing key (YouTube, Gemini, or Anthropic). Save it above first.</p>';
+        } else if (!result.length) {
+          html += '<p class="muted">No channels configured in PANEL_CHANNELS.</p>';
+        } else {
+          var channels = result.channels || [];
+          var added = channels.reduce(function (s, c) { return s + c.added; }, 0);
+          html += '<p>' + added + ' new video(s) processed across ' + channels.length + ' channel(s).</p>';
+          channels.forEach(function (c) {
+            (c.entries || []).forEach(function (entry) {
+              html += '<p>' + escapeHtml_(c.channel) + ': "' + escapeHtml_(entry.videoTitle) + '" — ' + escapeHtml_(entry.headline) + '</p>';
+            });
+          });
+          if (result.consensus) html += '<p class="muted">' + escapeHtml_(result.consensus.summary) + '</p>';
+        }
+      } else if (fnName === 'debugWeeklyVerdict') {
+        if (!result) {
+          html += '<p class="muted">No result — no readable squad/gameweek to build a verdict from yet.</p>';
+        } else {
+          html += '<p>' + escapeHtml_(result.headline) + '</p><p class="muted">' + escapeHtml_(result.body) + '</p>';
+        }
+      } else {
+        html += '<p>' + escapeHtml_(String(result)) + '</p>';
+      }
+      return html;
+    }
+
+    loadWire();
+  </script>
+</body>
+</html>
